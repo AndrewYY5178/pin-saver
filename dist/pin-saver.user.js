@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.3
+// @version      0.2.4
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -353,6 +353,7 @@
 
   // GM 优先（无 CORS 限制），失败回退页面 fetch（i.pinimg.com 实测对页面 Origin 放行）
   // v0.2.2：回退 fetch 加 AbortController 超时——此前无超时，body 卡住会永久挂起
+  // v0.2.4：两条通道都失败时写 Console（含原因）——批量下载整体失败时可直接看出是 403/超时/网络
   async function fetchBlob(url) {
     try {
       var buf = await gmFetch(url);
@@ -364,6 +365,9 @@
         var res = await fetch(url, { signal: ctrl.signal });
         if (!res.ok) throw new Error('fetch status ' + res.status);
         return await res.blob();
+      } catch (e2) {
+        try { console.warn('[pin-saver] 下载失败 ' + String(url).slice(0, 70) + '：' + (e2 && e2.message || e2)); } catch (e3) {}
+        throw e2;
       } finally { clearTimeout(t); }
     }
   }
@@ -548,15 +552,17 @@
       while (queue.length && !S.abortAll) {
         var item = queue.shift();
         var idx = items.indexOf(item);
-        // v0.2.3：进度显示当前项的简短 URL——卡住时可直接看出是图片还是视频、哪个链接
-        S.progress = '下载 ' + done + '/' + total + ' · ' + (item.isVideo ? '[视频]' : '[图]')
-          + String(item.origUrl || '').slice(0, 55);
+        // v0.2.3/0.2.4：进度显示当前项的简短 URL 与类型，并写 Console——卡住时最后一行日志就是卡点
+        var cur = (item.isVideo ? '[视频]' : '[图]') + String(item.origUrl || '').slice(0, 55);
+        S.progress = '下载 ' + done + '/' + total + ' · ' + cur;
         renderPanel();
+        try { console.log('[pin-saver] 开始下载 ' + (idx + 1) + '/' + total + ' · ' + cur); } catch (e0) {}
         try { await processItem(item, idx, folders, notes); }
         catch (e) { notes.push('第 ' + (idx + 1) + ' 项处理异常：' + (e && e.message || e)); }
         done++;
         S.progress = '下载 ' + done + '/' + total;
         renderPanel();
+        try { console.log('[pin-saver] 完成 ' + (idx + 1) + '/' + total + ' · ' + cur); } catch (e0) {}
       }
     }
     var workers = [];

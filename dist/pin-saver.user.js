@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.6
+// @version      0.2.7
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -355,17 +355,25 @@
   // GM 优先（无 CORS 限制），失败回退页面 fetch（i.pinimg.com 实测对页面 Origin 放行）
   // v0.2.2：回退 fetch 加 AbortController 超时——此前无超时，body 卡住会永久挂起
   // v0.2.4：两条通道都失败时写 Console（含原因）——批量下载整体失败时可直接看出是 403/超时/网络
-  async function fetchBlob(url) {
+  // v0.2.7：返回 ArrayBuffer（归一为 Uint8Array）而不是 Blob——JSZip 读 Blob 走 FileReader，
+  //         真实 TM 沙箱里 FileReader 读沙箱 Blob 会静默挂起（用户实测 zip 生成卡死），bytes 直传完全绕开。
+  function toBytes(x) {
+    if (x instanceof Uint8Array) return x;
+    if (x instanceof ArrayBuffer) return new Uint8Array(x);
+    if (x && x.buffer instanceof ArrayBuffer) return new Uint8Array(x.buffer, x.byteOffset || 0, x.byteLength || x.buffer.byteLength);
+    throw new Error('无法识别的二进制响应');
+  }
+
+  async function fetchBytes(url) {
     try {
-      var buf = await gmFetch(url);
-      return new Blob([buf]);
+      return toBytes(await gmFetch(url));
     } catch (e) {
       var ctrl = new AbortController();
       var t = setTimeout(function () { ctrl.abort(); }, 30000);
       try {
         var res = await fetch(url, { signal: ctrl.signal });
         if (!res.ok) throw new Error('fetch status ' + res.status);
-        return await res.blob();
+        return new Uint8Array(await res.arrayBuffer());
       } catch (e2) {
         try { console.warn('[pin-saver] 下载失败 ' + String(url).slice(0, 70) + '：' + (e2 && e2.message || e2)); } catch (e3) {}
         throw e2;
@@ -375,7 +383,7 @@
 
   // HLS：解析 m3u8 → 逐片下载 → 按序二进制拼接（无需 ffmpeg）
   async function fetchM3u8AndSegments(m3u8Url) {
-    var text = await (await fetchBlob(m3u8Url)).text();
+    var text = new TextDecoder('utf-8').decode(await fetchBytes(m3u8Url));
     var base = m3u8Url.slice(0, m3u8Url.lastIndexOf('/') + 1);
     var segments = [], initMap = null, seen = {};
     var lines = text.split('\n');
@@ -395,14 +403,16 @@
         S.skippedSegments += urls.length - k;
         throw new Error('HLS 分片总耗时超限，放弃剩余分片');
       }
-      try { parts.push(await fetchBlob(urls[k])); }
+      try { parts.push(await fetchBytes(urls[k])); }
       catch (e) { S.skippedSegments++; }
     }
     if (!parts.length) throw new Error('HLS 分片全部下载失败');
-    return {
-      blob: new Blob(parts, { type: initMap ? 'video/mp4' : 'video/mp2t' }),
-      ext: initMap ? 'mp4' : 'ts',
-    };
+    var totalLen = 0;
+    for (var p = 0; p < parts.length; p++) totalLen += parts[p].length;
+    var merged = new Uint8Array(totalLen);
+    var off = 0;
+    for (var q = 0; q < parts.length; q++) { merged.set(parts[q], off); off += parts[q].length; }
+    return { buf: merged, ext: initMap ? 'mp4' : 'ts' };
   }
 
   // 未登录拿不到视频直链时，按海报图 hash 猜测 mp4 直链（尽力而为）
@@ -422,7 +432,7 @@
         + p.x + '/' + p.y + '/' + p.z + '/' + p.hash + '.mp4';
       try {
         var buf = await gmFetch(url);
-        return { blob: new Blob([buf], { type: 'video/mp4' }), ext: 'mp4' };
+        return { buf: toBytes(buf), ext: 'mp4' };
       } catch (e) { /* 尝试下一档 */ }
     }
     return null;
@@ -486,18 +496,18 @@
           try {
             got = best.isHls
               ? await fetchM3u8AndSegments(best.url)
-              : { blob: await fetchBlob(best.url), ext: 'mp4' };
+              : { buf: await fetchBytes(best.url), ext: 'mp4' };
           } catch (e) { /* 落下一级 */ }
         }
       }
       if (!got && info.origUrl) got = await tryConstructMp4(info.origUrl);
       if (got) {
-        folders.videos.file(stem + '.' + got.ext, got.blob);
+        folders.videos.file(stem + '.' + got.ext, got.buf);
         S.dlSet.add(item.key);
         return;
       }
       try {
-        var cover = await fetchBlob(item.origUrl);
+        var cover = await fetchBytes(item.origUrl);
         folders.videos.file(stem + '_cover.' + extOf(item.origUrl), cover);
         S.dlSet.add(item.key);
         notes.push(stem + '：视频直链不可得（未登录平台限制），仅保存封面');
@@ -508,13 +518,13 @@
     }
 
     try {
-      var blob = await fetchBlob(info.origUrl);
-      folders.images.file(stem + '.' + extOf(info.origUrl), blob);
+      var bytes = await fetchBytes(info.origUrl);
+      folders.images.file(stem + '.' + extOf(info.origUrl), bytes);
       S.dlSet.add(item.key);
     } catch (e) {
       if (item.thumbUrl && item.thumbUrl !== info.origUrl) {
         try {
-          var tb = await fetchBlob(item.thumbUrl);
+          var tb = await fetchBytes(item.thumbUrl);
           folders.errors.file(stem + '_thumb.' + extOf(item.thumbUrl), tb);
           notes.push(stem + '：原图下载失败，已用页面缩略图替代');
           return;
@@ -608,6 +618,7 @@
       }
       S.lastZip = { blob: blob, name: name };   // 「下载 zip」按钮兜底：点击时新建用户手势，必定触发
       flushDlSet();
+      try { console.log('[pin-saver] zip 已生成，大小 ' + Math.round(blob.size / 104857.6) / 10 + ' MB'); } catch (e0) {}
       log('zip 已生成：' + name + (notes.length ? '（失败/降级 ' + notes.length + ' 项，详见 zip 内说明.txt）' : '')
         + '。若浏览器未弹出下载，点面板「下载 zip」按钮');
     } catch (e) {
@@ -644,18 +655,18 @@
         var best = getBestVideo(detail.videoList);
         var got = best.isHls
           ? await fetchM3u8AndSegments(best.url)
-          : { blob: await fetchBlob(best.url), ext: 'mp4' };
-        downloadBlob(got.blob, sanitize(detail.title || ('pin-' + id)) + '.' + got.ext);
+          : { buf: await fetchBytes(best.url), ext: 'mp4' };
+        downloadBlob(new Blob([got.buf]), sanitize(detail.title || ('pin-' + id)) + '.' + got.ext);
         S.dlSet.add(item ? item.key : ('pin-' + id));
         log('视频已保存');
       } else if (detail && detail.origUrl) {
-        var b1 = await fetchBlob(detail.origUrl);
-        downloadBlob(b1, sanitize(detail.title || ('pin-' + id)) + '.' + extOf(detail.origUrl));
+        var b1 = await fetchBytes(detail.origUrl);
+        downloadBlob(new Blob([b1]), sanitize(detail.title || ('pin-' + id)) + '.' + extOf(detail.origUrl));
         S.dlSet.add(item ? item.key : ('pin-' + id));
         log('图片已保存');
       } else if (item) {
-        var b2 = await fetchBlob(item.origUrl);
-        downloadBlob(b2, sanitize(item.title || ('pin-' + (id || ''))) + '.' + extOf(item.origUrl));
+        var b2 = await fetchBytes(item.origUrl);
+        downloadBlob(new Blob([b2]), sanitize(item.title || ('pin-' + (id || ''))) + '.' + extOf(item.origUrl));
         S.dlSet.add(item.key);
         log('图片已保存');
       } else {

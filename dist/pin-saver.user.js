@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.8
+// @version      0.3.0
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -12,6 +12,8 @@
 // @connect      i.pinimg.com
 // @connect      v.pinimg.com
 // @connect      *.pinimg.com
+// @connect      api-edge.cognitive.microsofttranslator.com
+// @connect      api.mymemory.translated.net
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -47,6 +49,7 @@
     apiFails: 0,
     skippedSegments: 0,
     cfg: { skipSaved: true, skipDownloaded: true },  // 面板两个去重开关（本次会话生效）
+    theme: 'indigo',         // v0.3.0：主题 key（THEMES），GM 存储持久化
     dlSet: new Set(),       // 本地已下载 key 集合（GM 存储持久化，跨会话；init 时异步加载）
     skippedKeys: new Map(), // key -> 'saved'|'dl'（已判跳过的不重复计数）
     skippedSaved: 0,
@@ -449,10 +452,118 @@
     return out || 'untitled';
   }
 
-  function fileStem(item, idx) {
+  // v0.3.0：「序号 + 标题」命名（去掉 hash/pin id 段，标题由调用方经 titleFor 预处理）
+  function fileStem(item, idx, title) {
     var nnn = String(idx + 1).padStart(3, '0');
-    var tag = item.id || (hashOf(item.origUrl) || '').slice(0, 8) || 'unknown';
-    return nnn + '-' + tag + '-' + (sanitize(item.title) || 'untitled');
+    return nnn + '-' + (title || '图');
+  }
+
+  // 重名去重：'001-图.jpg' 已存在时变 '001-图-2.jpg'（去掉哈希后不同图可能同标题）
+  function uniq(used, name) {
+    if (!used[name]) { used[name] = true; return name; }
+    var dot = name.lastIndexOf('.');
+    var base = dot > 0 ? name.slice(0, dot) : name;
+    var ext = dot > 0 ? name.slice(dot) : '';
+    var n = 2;
+    while (used[base + '-' + n + ext]) n++;
+    var out = base + '-' + n + ext;
+    used[out] = true;
+    return out;
+  }
+
+  // v0.3.0 双语标题：中文标题自动补英文（MyMemory 免费接口），失败静默回退单语
+  var trCache = {};   // 同一标题只翻译一次（存最终双语串）
+  var trFails = 0;    // 连续失败 3 次后熔断，后续只留原标题
+  var trWait = Promise.resolve();
+
+  async function titleFor(item) {
+    var t = sanitize(item.title || '');
+    if (t === 'untitled') t = '';
+    if (!t || trFails >= 3) return t;
+    if (!/[一-鿿]/.test(t)) return t;          // 无中文不翻译（英文标题原样）
+    if (trCache[t]) return trCache[t];
+    var en = await translateToEn(t);
+    if (en) {
+      var out = t.slice(0, 28) + '-' + en.slice(0, 40);
+      trCache[t] = out;
+      return out;
+    }
+    return t;
+  }
+
+  // 翻译请求：GM.xmlHttpRequest 优先——Pinterest 页面 CSP 的 connect-src 白名单不含翻译域名，
+  // 页面 fetch 直连会被 CSP 拦截（实测）；GM 请求从扩展上下文发出不受页面 CSP 限制。
+  // 无 GM 环境回退页面 fetch（测试环境快速失败）。8s 超时 + 调用失败立即 settle。
+  function trJson(url, method, body, contentType) {
+    return new Promise(function (resolve, reject) {
+      if (typeof GM !== 'undefined' && GM.xmlHttpRequest) {
+        var settled = false, req = null;
+        var guard = setTimeout(function () {
+          if (settled) return; settled = true;
+          try { if (req && req.abort) req.abort(); } catch (e) {}
+          reject(new Error('翻译请求超时'));
+        }, 8000);
+        try {
+          req = GM.xmlHttpRequest({
+            method: method, url: url, data: body || undefined,
+            headers: contentType ? { 'Content-Type': contentType } : undefined,
+            timeout: 8000,
+            onload: function (r) {
+              if (settled) return; settled = true; clearTimeout(guard);
+              if (r.status >= 200 && r.status < 300) {
+                try { resolve(JSON.parse(r.responseText)); }
+                catch (e) { reject(new Error('翻译响应解析失败')); }
+              } else reject(new Error('翻译接口 status ' + r.status));
+            },
+            onerror: function () { if (!settled) { settled = true; clearTimeout(guard); reject(new Error('翻译网络错误')); } },
+            ontimeout: function () { if (!settled) { settled = true; clearTimeout(guard); reject(new Error('翻译超时')); } },
+          });
+        } catch (e) { settled = true; clearTimeout(guard); reject(e); }
+      } else {
+        var ctrl = new AbortController();
+        var t = setTimeout(function () { ctrl.abort(); }, 8000);
+        fetch(url, {
+          method: method,
+          headers: contentType ? { 'Content-Type': contentType } : undefined,
+          body: body || undefined,
+          signal: ctrl.signal,
+        }).then(function (res) {
+          if (!res.ok) throw new Error('status ' + res.status);
+          return res.json();
+        }).then(function (j) { clearTimeout(t); resolve(j); },
+          function (e) { clearTimeout(t); reject(e); });
+      }
+    });
+  }
+
+  // 微软 Edge 免费翻译接口（POST JSON）优先，MyMemory 兜底；
+  // 请求间 300ms 节流 + 连续 3 次失败熔断（只留原标题）。失败不影响打包主流程。
+  async function translateToEn(text) {
+    trWait = trWait.then(function () { return sleep(300); });
+    await trWait;
+    var en = null;
+    try {
+      var j = await trJson(
+        'https://api-edge.cognitive.microsofttranslator.com/translate?from=zh-Hans&to=en&api-version=3.0',
+        'POST', JSON.stringify([{ Text: text }]), 'application/json');
+      var m = j && j[0] && j[0].translations && j[0].translations[0] && j[0].translations[0].text;
+      en = sanitize(String(m || '')).toLowerCase();
+    } catch (e) { /* 落下一个接口 */ }
+    if (!en || en === 'untitled') {
+      try {
+        var j2 = await trJson(
+          'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=zh-CN|en',
+          'GET', null, null);
+        en = sanitize(String((j2 && j2.responseData && j2.responseData.translatedText) || '')).toLowerCase();
+      } catch (e2) { /* 落单语回退 */ }
+    }
+    if (!en || en === 'untitled') {
+      trFails++;
+      if (trFails >= 3) { try { console.warn('[pin-saver] 翻译接口连续失败，已停用双语标题'); } catch (e0) {} }
+      return null;
+    }
+    trFails = 0;
+    return en;
   }
 
   function stamp() {
@@ -604,7 +715,7 @@
       if (detail.origUrl) info.origUrl = detail.origUrl;
       info.videoList = detail.videoList;
     }
-    var stem = fileStem(info, idx);
+    var stem = fileStem(info, idx, await titleFor(info));
 
     if (info.isVideo) {
       // 1) 登录态 API 的 video_list；2) 海报 hash 构造直链；3) 封面兜底
@@ -664,10 +775,11 @@
       log('打包总时长超限（疑似网络挂起），已中止剩余项目，可重新点击打包');
     }, CFG.zipWatchdogMs);
     var entries = [];
+    var used = {};   // v0.3.0：zip 内重名去重（同标题不同图）
     var folders = {   // 与旧 JSZip folder API 同形，processItem 不用改；file() 直接进 entries
-      images: { file: function (n, d) { entries.push({ name: 'images/' + n, data: d }); } },
-      videos: { file: function (n, d) { entries.push({ name: 'videos/' + n, data: d }); } },
-      errors: { file: function (n, d) { entries.push({ name: 'error_thumbnails/' + n, data: d }); } },
+      images: { file: function (n, d) { entries.push({ name: 'images/' + uniq(used, n), data: d }); } },
+      videos: { file: function (n, d) { entries.push({ name: 'videos/' + uniq(used, n), data: d }); } },
+      errors: { file: function (n, d) { entries.push({ name: 'error_thumbnails/' + uniq(used, n), data: d }); } },
     };
     var notes = [];
     var items = Array.from(S.pins.values());
@@ -707,12 +819,13 @@
         + '生成时间: ' + new Date().toLocaleString() + '\n'
         + '共处理 ' + total + ' 个 pin\n'
         + '去重设置: 跳过已收藏=' + (S.cfg.skipSaved ? '开' : '关') + '，跳过已下载=' + (S.cfg.skipDownloaded ? '开' : '关') + '\n'
-        + '提示: 「已收藏」检测依赖页面标记，未登录或页面改版时自动失效（宁可多收）。\n\n'
+        + '提示: 「已收藏」检测依赖页面标记，未登录或页面改版时自动失效（宁可多收）。\n'
+        + '出品: AndDream (github.com/AndrewYY5178/pin-saver)\n\n'
         + (notes.length
           ? '降级 / 失败记录:\n' + notes.map(function (n) { return '- ' + n; }).join('\n')
           : '全部成功，无降级项。')),
     });
-    var name = 'pinterest-' + detectPageType() + '-' + stamp() + '.zip';
+    var name = 'pinterest-' + stamp().slice(0, 13) + '.zip';   // v0.3.0：pinterest-YYYYMMDD-HHMM.zip
     try {
       S.progress = '下载完成，生成 zip 中…';
       renderPanel();
@@ -794,18 +907,84 @@
   }
 
   /* ===== [UI] 悬浮按钮与面板 ===== */
+  // v0.3.0 主题系统：token 配色来自 anddream-brand 品牌目录，默认 Indigo 主线；
+  // 面板右上角色点切换（每主题一组），选择经 GM 存储持久化。每主题只用 1 个强调色（克制）。
+  var THEMES = {
+    indigo: {
+      name: 'Indigo 品牌主线', paper: '#FAFAF8', ink: '#111111', inkLight: '#55554E', rule: '#D9D9D0',
+      accent: '#254E7A', onAccent: '#FFFFFF', fab: '#111111', fabText: '#FFFFFF',
+      swatches: ['#254E7A', '#FAFAF8'],
+    },
+    'indigo-dark': {
+      name: 'Indigo 深色版', paper: '#18181A', ink: '#E0DDD5', inkLight: '#8C8A85', rule: '#3A3A3C',
+      accent: '#6BA0D6', onAccent: '#111111', fab: '#6BA0D6', fabText: '#111111',
+      swatches: ['#6BA0D6', '#18181A'],
+    },
+    rose: {
+      name: '奶油玫瑰', paper: '#F6F6F0', ink: '#39393A', inkLight: '#7A746C', rule: '#E3E0D5',
+      accent: '#C94C74', onAccent: '#FFFFFF', fab: '#39393A', fabText: '#FFFFFF',
+      swatches: ['#C94C74', '#F6F6F0'],
+    },
+    deepsea: {
+      name: '深海蓝', paper: '#F8F4E9', ink: '#1B2A33', inkLight: '#6A7A80', rule: '#E2DCC8',
+      accent: '#00859F', onAccent: '#FFFFFF', fab: '#1B2A33', fabText: '#FFFFFF',
+      swatches: ['#00859F', '#F8F4E9'],
+    },
+    copper: {
+      name: '铜版余温', paper: '#FAF8F3', ink: '#141110', inkLight: '#8A7A68', rule: '#E4DCCD',
+      accent: '#8B5A3C', onAccent: '#FFFFFF', fab: '#141110', fabText: '#FFFFFF',
+      swatches: ['#8B5A3C', '#FAF8F3'],
+    },
+    night: {
+      name: '暗夜 3D', paper: '#050508', ink: '#E8E6E1', inkLight: '#8A8A92', rule: '#26262E',
+      accent: '#4499FF', onAccent: '#FFFFFF', fab: '#050508', fabText: '#E8E6E1', rainbow: true,
+      swatches: ['#4499FF', '#050508'],
+    },
+  };
+
+  function theme() { return THEMES[S.theme] || THEMES.indigo; }
+
+  // 应用主题：移除重建 FAB 与面板（避免动态改大量内联样式），renderPanel 恢复显示状态
+  function applyTheme(k) {
+    if (!THEMES[k] || k === S.theme) return;
+    S.theme = k;
+    try { if (typeof GM !== 'undefined' && GM.setValue) GM.setValue('psaver_theme', k); } catch (e) {}
+    var oldP = document.getElementById('psaver-panel');
+    if (oldP) oldP.remove();
+    ensurePanel();
+    var oldF = document.getElementById('psaver-fab');
+    if (oldF) oldF.remove();
+    ensureFab();
+    renderPanel();
+  }
+
+  // init 时异步读回主题选择（GM.getValue 是 Promise）
+  function loadTheme() {
+    if (typeof GM === 'undefined' || !GM.getValue) return;
+    try {
+      GM.getValue('psaver_theme', 'indigo').then(function (t) {
+        applyTheme(t);
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
   function ensureFab() {
     if (document.getElementById('psaver-fab')) return;
+    var t = theme();
     var fab = document.createElement('div');
     fab.id = 'psaver-fab';
     fab.style.cssText =
-      'position:fixed;right:16px;bottom:16px;z-index:2147483646;background:#111;color:#fff;'
+      'position:fixed;right:16px;bottom:16px;z-index:2147483646;background:' + t.fab + ';color:' + t.fabText + ';'
       + 'font:13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:10px 14px;'
       + 'border-radius:24px;cursor:pointer;box-shadow:0 2px 12px rgba(0,0,0,.25);'
-      + 'user-select:none;display:flex;align-items:center;gap:8px;';
+      + 'user-select:none;display:flex;align-items:center;gap:8px;overflow:hidden;';
     fab.innerHTML = '<span>保存</span>'
-      + '<span id="psaver-count" style="display:none;background:#e60023;border-radius:10px;'
-      + 'padding:1px 7px;font-size:11px;">0</span>';
+      + '<span id="psaver-count" style="display:none;background:' + t.accent + ';border-radius:10px;'
+      + 'padding:1px 7px;font-size:11px;">0</span>'
+      + (t.rainbow
+        ? '<span style="position:absolute;left:0;right:0;bottom:0;height:3px;'
+        + 'background:linear-gradient(90deg,#FF5544,#FF9944,#FFDD44,#44EE88,#4499FF,#9955FF,#FF55AA);"></span>'
+        : '');
     fab.addEventListener('click', function () {
       S.panelOpen = !S.panelOpen;
       renderPanel();
@@ -815,45 +994,86 @@
 
   function ensurePanel() {
     if (document.getElementById('psaver-panel')) return;
+    var t = theme();
     var el = document.createElement('div');
     el.id = 'psaver-panel';
     el.style.cssText =
-      'position:fixed;right:16px;bottom:64px;z-index:2147483646;width:290px;background:#fff;'
-      + 'color:#111;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
+      'position:fixed;right:16px;bottom:64px;z-index:2147483646;width:290px;background:' + t.paper + ';'
+      + 'color:' + t.ink + ';font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
       + 'border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.18);padding:14px;display:none;';
     el.innerHTML =
-      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
-      + '<b>Pinterest 批量保存</b> <span id="psaver-ver" style="font-size:11px;color:#999;"></span>'
-      + '<span id="psaver-close" style="cursor:pointer;color:#999;font-size:15px;line-height:1;">x</span>'
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
+      + '<b>Pinterest 批量保存</b>'
+      + '<span style="display:flex;align-items:center;gap:6px;">'
+      + '<span id="psaver-ver" style="font-size:11px;color:' + t.inkLight + ';"></span>'
+      + '<button id="psaver-theme-btn" title="切换主题" style="display:inline-flex;align-items:center;gap:4px;'
+      + 'border:1px solid ' + t.rule + ';background:' + t.paper + ';color:' + t.ink
+      + ';border-radius:6px;cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;">'
+      + '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:' + t.accent + ';"></span>主题</button>'
+      + '<span id="psaver-close" style="cursor:pointer;color:' + t.inkLight + ';font-size:15px;line-height:1;">x</span>'
+      + '</span>'
       + '</div>'
+      + '<div id="psaver-themes" style="display:none;flex-wrap:wrap;gap:5px;margin-bottom:8px;"></div>'
       + '<div id="psaver-status" style="margin-bottom:6px;">已收集 0 个</div>'
-      + '<div id="psaver-progress" style="margin-bottom:8px;color:#666;min-height:18px;"></div>'
-      + '<div id="psaver-opts" style="margin-bottom:10px;font-size:12px;color:#444;">'
+      + '<div id="psaver-progress" style="margin-bottom:8px;color:' + t.inkLight + ';min-height:18px;"></div>'
+      + '<div id="psaver-opts" style="margin-bottom:10px;font-size:12px;color:' + t.ink + ';">'
       + '<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">'
       + '<input type="checkbox" id="psaver-opt-saved" style="margin:0;"> 跳过已收藏'
-      + '<span id="psaver-opt-saved-note" style="display:none;color:#999;">（收藏夹页自动关闭）</span></label>'
+      + '<span id="psaver-opt-saved-note" style="display:none;color:' + t.inkLight + ';">（收藏夹页自动关闭）</span></label>'
       + '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;">'
       + '<input type="checkbox" id="psaver-opt-dl" style="margin:0;"> 跳过已下载过的</label>'
       + '</div>'
       + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
-      + '<button id="psaver-start" style="flex:1;padding:7px 0;background:#111;color:#fff;border:0;'
-      + 'border-radius:8px;cursor:pointer;font:inherit;">开始收集</button>'
-      + '<button id="psaver-stop" style="flex:1;padding:7px 0;background:#fff;color:#111;'
-      + 'border:1px solid #ccc;border-radius:8px;cursor:pointer;font:inherit;display:none;">停止</button>'
-      + '<button id="psaver-zip" style="flex:1;padding:7px 0;background:#e60023;color:#fff;border:0;'
-      + 'border-radius:8px;cursor:pointer;font:inherit;">打包下载 ZIP</button>'
-      + '<button id="psaver-single" style="display:none;width:100%;padding:7px 0;background:#111;'
-      + 'color:#fff;border:0;border-radius:8px;cursor:pointer;font:inherit;">保存此 pin</button>'
-      + '<button id="psaver-redl" style="display:none;width:100%;padding:9px 0;background:#e60023;color:#fff;'
-      + 'border:0;border-radius:8px;cursor:pointer;font:inherit;font-weight:bold;">下载 zip</button>'
+      + '<button id="psaver-start" style="flex:1;padding:7px 0;background:' + t.accent + ';color:' + t.onAccent
+      + ';border:0;border-radius:8px;cursor:pointer;font:inherit;">开始收集</button>'
+      + '<button id="psaver-stop" style="flex:1;padding:7px 0;background:' + t.paper + ';color:' + t.ink
+      + ';border:1px solid ' + t.rule + ';border-radius:8px;cursor:pointer;font:inherit;display:none;">停止</button>'
+      + '<button id="psaver-zip" style="flex:1;padding:7px 0;background:' + t.accent + ';color:' + t.onAccent
+      + ';border:0;border-radius:8px;cursor:pointer;font:inherit;">打包下载 ZIP</button>'
+      + '<button id="psaver-single" style="display:none;width:100%;padding:7px 0;background:' + t.accent
+      + ';color:' + t.onAccent + ';border:0;border-radius:8px;cursor:pointer;font:inherit;">保存此 pin</button>'
+      + '<button id="psaver-redl" style="display:none;width:100%;padding:9px 0;background:' + t.accent + ';color:'
+      + t.onAccent + ';border:0;border-radius:8px;cursor:pointer;font:inherit;font-weight:bold;">下载 zip</button>'
       + '</div>'
       + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">'
-      + '<span style="font-size:11px;color:#999;">日志（最近 8 条）</span>'
-      + '<button id="psaver-copylog" style="border:0;background:none;color:#e60023;cursor:pointer;font:inherit;font-size:11px;">复制全部日志</button>'
+      + '<span style="font-size:11px;color:' + t.inkLight + ';">日志（最近 8 条）</span>'
+      + '<button id="psaver-copylog" style="border:0;background:none;color:' + t.accent
+      + ';cursor:pointer;font:inherit;font-size:11px;">复制全部日志</button>'
       + '</div>'
-      + '<div id="psaver-log" style="color:#888;font-size:11px;white-space:pre-wrap;word-break:break-all;'
-      + 'max-height:110px;overflow:auto;min-height:18px;"></div>';
+      + '<div id="psaver-log" style="color:' + t.inkLight + ';font-size:11px;white-space:pre-wrap;word-break:break-all;'
+      + 'max-height:110px;overflow:auto;min-height:18px;"></div>'
+      // v0.3.0 AndDream 水印：品牌衬线字体 + 克制的主题色小点，无 emoji
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">'
+      + '<span style="font-size:11px;color:' + t.inkLight
+      + ';font-family:\'Playfair Display\',\'Noto Serif SC\',Georgia,serif;letter-spacing:.5px;">AndDream 出品</span>'
+      + '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + t.accent + ';"></span>'
+      + '</div>';
     document.body.appendChild(el);
+
+    // 主题选择器（v0.3.0）：点标题行「主题」按钮弹出，选中后收起；
+    // 选项 pill = 色点对 + 名称，当前主题用强调色描边高亮
+    var themesEl = el.querySelector('#psaver-themes');
+    Object.keys(THEMES).forEach(function (k) {
+      var th = THEMES[k];
+      var g = document.createElement('span');
+      g.title = th.name;
+      g.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border-radius:12px;'
+        + 'cursor:pointer;font-size:11px;background:' + t.paper + ';color:' + t.ink + ';'
+        + 'border:1px solid ' + (k === S.theme ? th.accent : t.rule) + ';';
+      th.swatches.forEach(function (c) {
+        var d = document.createElement('span');
+        d.style.cssText = 'display:inline-block;width:7px;height:7px;border-radius:50%;background:' + c + ';';
+        g.appendChild(d);
+      });
+      var lbl = document.createElement('span');
+      lbl.textContent = th.name;
+      g.appendChild(lbl);
+      g.addEventListener('click', function () { applyTheme(k); });
+      themesEl.appendChild(g);
+    });
+    el.querySelector('#psaver-theme-btn').addEventListener('click', function () {
+      themesEl.style.display = themesEl.style.display === 'none' ? 'flex' : 'none';
+    });
 
     el.querySelector('#psaver-close').addEventListener('click', function () {
       S.panelOpen = false;
@@ -979,6 +1199,7 @@
 
   function init() {
     loadDlSet().then(function (s) { S.dlSet = s; });   // GM 存储异步读回（v0.2.2 修复跨会话去重）
+    loadTheme();                                       // v0.3.0：主题选择异步读回后重建 UI
     ensureFab();
     ensurePanel();
     renderPanel();
@@ -1011,6 +1232,11 @@
       getBestVideo: getBestVideo,
       posterPath: posterPath,
       fileStem: fileStem,
+      uniq: uniq,
+      titleFor: titleFor,
+      translateToEn: translateToEn,
+      THEMES: THEMES,
+      theme: theme,
       labelMeansSaved: labelMeansSaved,
       isSavedCard: isSavedCard,
       loadDlSet: loadDlSet,

@@ -47,7 +47,7 @@ const context = vm.createContext({
   },
   location: { pathname: '/search/pins/', origin: 'https://www.pinterest.com' },
   GM: {
-    xmlHttpRequest() {},
+    xmlHttpRequest() { throw new Error('GM unavailable in smoke'); },   // 立即失败：翻译走 GM 分支快速 reject
     getValue: (k, def) => (k in gmStore ? gmStore[k] : def),
     setValue: (k, v) => { gmStore[k] = v; },
   },
@@ -123,12 +123,34 @@ eq('hashOf 32hex', T.hashOf(ORIG), H);
 eq('sanitize 非法字符', T.sanitize('a/b\\c:d*e?f"g<h>i|j'), 'a_b_c_d_e_f_g_h_i_j');
 eq('sanitize 空 → untitled', T.sanitize('  '), 'untitled');
 ok('sanitize 截断 60', T.sanitize('x'.repeat(100)).length === 60);
-eq('fileStem 序号+id+标题',
-  T.fileStem({ id: '123456', title: '客厅/极简?设计', origUrl: ORIG }, 0),
-  '001-123456-客厅_极简_设计');
-eq('fileStem 无 id 用 hash 前 8 位',
-  T.fileStem({ id: null, title: null, origUrl: ORIG }, 4),
-  '005-01234567-untitled');
+eq('fileStem 序号+标题',
+  T.fileStem({ id: '123456', title: '客厅/极简?设计', origUrl: ORIG }, 0, '客厅_极简_设计'),
+  '001-客厅_极简_设计');
+eq('fileStem 无标题 → 图',
+  T.fileStem({ id: null, title: null, origUrl: ORIG }, 4, ''),
+  '005-图');
+
+console.log('uniq 重名去重:');
+var used1 = {};
+eq('uniq 首次不重复', T.uniq(used1, '001-图.jpg'), '001-图.jpg');
+eq('uniq 第二次加 -2', T.uniq(used1, '001-图.jpg'), '001-图-2.jpg');
+eq('uniq 第三次加 -3 且扩展名保留', T.uniq(used1, '001-图.jpg'), '001-图-3.jpg');
+
+console.log('主题系统:');
+ok('THEMES 含 6 套主题且默认 indigo 在列',
+  T.THEMES && Object.keys(T.THEMES).length === 6 && !!T.THEMES.indigo);
+ok('每套主题 token 齐全', Object.keys(T.THEMES).every(function (k) {
+  var th = T.THEMES[k];
+  return th.name && th.paper && th.ink && th.inkLight && th.rule
+    && th.accent && th.onAccent && th.fab && th.fabText && Array.isArray(th.swatches);
+}));
+ok('theme() 默认返回 indigo', T.theme() === T.THEMES.indigo);
+
+console.log('双语标题（smoke 无网络，验证失败回退路径）:');
+eq('translateToEn 网络不可用返回 null', await T.translateToEn('客厅设计'), null);
+eq('titleFor 无中文不翻译', await T.titleFor({ title: 'Living room ideas' }), 'Living room ideas');
+eq('titleFor 中文但翻译失败回退单语', await T.titleFor({ title: '客厅设计' }), '客厅设计');
+eq('titleFor 空标题返回空串', await T.titleFor({ title: null }), '');
 
 console.log('视频选择:');
 eq('720P MP4 优先',

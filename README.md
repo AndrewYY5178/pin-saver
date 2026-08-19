@@ -2,6 +2,8 @@
 
 一个油猴脚本：在 Pinterest 页面上点几下，批量收集图片 / GIF / 视频的**原始高清文件**（不压缩），打包成单个 Zip 下载。登录或未登录都能用，Edge 与 Chrome 通用。
 
+由 **AndDream** 出品（github.com/AndrewYY5178/pin-saver）。
+
 ## 为什么是油猴脚本（而不是扩展 / 书签 + 本地服务）
 
 - **跨浏览器**：同一个 `.user.js` 文件，Edge / Chrome 各装一次 Tampermonkey 后通用，改一次两边生效。
@@ -14,9 +16,9 @@
 |---|---|
 | `dist/pin-saver.user.js` | **成品脚本**——拖进 Tampermonkey 安装的安装文件 |
 | `src/pin-saver.user.js` | 可读源码（改这里后用 `node build.mjs` 重新生成） |
-| `build.mjs` | 把源码与内嵌的 JSZip 合并为成品（`node build.mjs`） |
+| `build.mjs` | 生成成品脚本（`node build.mjs`） |
 | `smoke.mjs` | 核心纯函数自测（`node smoke.mjs`） |
-| `vendor/jszip.min.js` | 内嵌的 JSZip（构建时打包进成品，运行时离线可用） |
+| `vendor/jszip.min.js` | 历史参考（v0.2.8 起已弃用 JSZip，不再内嵌） |
 
 ## 安装（一次性；Edge 和 Chrome 各做一次）
 
@@ -40,6 +42,8 @@
 
 - 收集自动停止条件：页面高度连续 12 轮不再增长，或达到收集上限（默认 300，改 `src/pin-saver.user.js` 里的 `CFG.maxCollect` 后重新 `node build.mjs`）。
 - 打包进度在面板显示；zip 内 `images/` 放图片、`videos/` 放视频、`说明.txt` 记录降级项（如「视频仅封面」）。
+- zip 压缩包名为 `pinterest-日期-时间.zip`（如 `pinterest-20260819-2035.zip`）；zip 内文件按「序号-标题」命名（如 `001-客厅设计.jpg`），中文标题自动补英文（`001-客厅设计-living room.jpg`，翻译接口不可用时自动回退单语），无标题的为 `001-图.jpg`，重名自动加 `-2`。
+- 面板右上角有 6 组小色点可切换主题（默认 Indigo 品牌色，另含 Indigo 深色版 / 奶油玫瑰 / 深海蓝 / 铜版余温 / 暗夜 3D），选择会被记住；面板底部有 AndDream 出品水印。
 - 收集期间可以随时点「停止」，已收集的部分仍可打包。
 - 面板有两个去重开关（默认勾选）：「**跳过已收藏**」——跳过你在 Pinterest 上已收藏过的 pin（依赖登录态页面标记，收藏夹页会自动关闭该跳过）；「**跳过已下载**」——跳过本地记录里已下载过的素材（记录存在 Tampermonkey 存储中，跨会话有效）。
 - 打包完成后若浏览器没有自动弹出下载，点面板的「**下载 zip**」按钮即可（点击时的新用户手势必定触发下载，文件在浏览器默认下载目录，`Ctrl+J` / `Cmd+Shift+J` 查看下载列表）。
@@ -55,7 +59,9 @@
 - **GIF**：Pinterest 的 GIF pin 原图直接以 `.gif` 结尾，按图片路径下载即保留动图。
 - **去重**：收集时按卡片保存按钮的 `aria-label`（含 "Saved" /「已保存」）跳过已收藏 pin（仅登录态有该标记，未登录自动全收）；按本地 `GM_setValue` 记录跳过已下载过的（key = pin id 或原图 hash）。看 `isSavedCard()` / `loadDlSet()` / `flushDlSet()`。
 - **下载**：打包完成后用页面 `a[download]` 触发下载，并保留 zip 到面板「下载 zip」按钮——点击按钮时是新用户手势，必定触发（`GM_download` 对 blob URL 会存成 txt，已弃用）。打包流程有 try/finally + 总时长看门狗（`CFG.zipWatchdogMs`，默认 10 分钟）：任何异常或网络挂起都会恢复面板按钮，不会卡在灰色状态。看 `saveZip()` / `downloadBlob()`。
-- **zip 生成**：文件内容以 **Uint8Array 直传** JSZip（`compression: 'STORE'`，图片/视频已是压缩格式）——JSZip 读 Blob 要走 FileReader，在真实 Tampermonkey 沙箱里会静默挂起，bytes 直传完全绕开；生成时先试流式（省内存），失败/超时（120s）自动重试普通模式。
+- **zip 生成（v0.2.8 起自写）**：完全弃用 JSZip（它在真实 Tampermonkey 沙箱里会静默挂起），改为自写 STORE zip 生成器——CRC32 slice-by-4 查表 + 手写 local/central/EOCD 头（flag 0x0800 保证中文文件名），纯 Uint8Array 拼接、全同步逻辑（大文件分段让出主线程），不存在可挂起的第三方异步管线。图片/视频已是压缩格式，STORE 不压缩即可。看 `makeZip()`。
+- **文件名与双语标题（v0.3.0）**：文件名 = 「序号-标题」（去掉了 hash/pin id 段）；含中文的标题自动补英文（微软 Edge 免费翻译接口优先、MyMemory 兜底，均免费无需 key）。翻译请求走 `GM.xmlHttpRequest`——Pinterest 页面 CSP 的 connect-src 白名单不含翻译域名，页面 fetch 直连会被拦截；8s 超时 + 300ms 节流 + 连续 3 次失败熔断，失败静默回退单语，不影响打包。**首次更新到 v0.3.0 时 Tampermonkey 会弹「访问新域名」确认，点允许即可**。看 `fileStem()` / `titleFor()` / `translateToEn()` / `uniq()`。
+- **主题（v0.3.0）**：6 套主题 token 定义在 `THEMES`（配色取自 AndDream 品牌目录），点面板标题行「主题」按钮弹出选择，`GM_setValue('psaver_theme')` 持久化；切换时移除重建面板。看 `applyTheme()`。
 
 ## 已知限制
 

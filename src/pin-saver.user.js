@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.1
+// @version      0.2.2
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -11,6 +11,7 @@
 // @grant        GM.getValue
 // @connect      i.pinimg.com
 // @connect      v.pinimg.com
+// @connect      *.pinimg.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -26,6 +27,7 @@
     apiFailLimit: 3,     // 内部 API 失败 N 次后本会话熔断
     apiTimeoutMs: 3000,
     dlHistLimit: 5000,   // 本地「已下载」记录条数上限（GM 存储容量安全）
+    zipWatchdogMs: 10 * 60 * 1000,  // 打包总时长看门狗：超时强制恢复 UI（防网络挂起卡死）
   };
 
   // 多候选选择器：未登录门控卡片 / 登录态新版 / 登录态旧版 / 通用兜底
@@ -45,7 +47,7 @@
     apiFails: 0,
     skippedSegments: 0,
     cfg: { skipSaved: true, skipDownloaded: true },  // 面板两个去重开关（本次会话生效）
-    dlSet: loadDlSet(),     // 本地已下载 key 集合（GM 存储持久化，跨会话）
+    dlSet: new Set(),       // 本地已下载 key 集合（GM 存储持久化，跨会话；init 时异步加载）
     skippedKeys: new Map(), // key -> 'saved'|'dl'（已判跳过的不重复计数）
     skippedSaved: 0,
     skippedDownloaded: 0,
@@ -73,9 +75,12 @@
   }
 
   // 已下载记录：GM 存储持久化（跨会话），条数上限 CFG.dlHistLimit
-  function loadDlSet() {
+  // 注意：GM.getValue 返回 Promise，必须 await（v0.2.2 修复——此前读回恒为空，跨会话去重失效）
+  async function loadDlSet() {
     try {
-      var v = (typeof GM !== 'undefined' && GM.getValue) ? GM.getValue('psaver_downloaded', []) : [];
+      var v = (typeof GM !== 'undefined' && GM.getValue)
+        ? await GM.getValue('psaver_downloaded', [])
+        : [];
       return new Set(Array.isArray(v) ? v : []);
     } catch (e) { return new Set(); }
   }
@@ -252,11 +257,15 @@
   }
 
   /* ===== [API] 登录态增强（失败静默降级 DOM，未登录必 403） ===== */
-  function fetchWithTimeout(url, opts, ms) {
+  // 带超时的 JSON 请求：AbortController 覆盖到 body 读取完成（旧版只覆盖响应头，body 卡住仍会挂起）
+  async function fetchJsonWithTimeout(url, opts, ms) {
     var ctrl = new AbortController();
     var t = setTimeout(function () { ctrl.abort(); }, ms);
-    return fetch(url, Object.assign({}, opts, { signal: ctrl.signal }))
-      .finally(function () { clearTimeout(t); });
+    try {
+      var res = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+      if (!res.ok) throw new Error('status ' + res.status);
+      return await res.json();
+    } finally { clearTimeout(t); }
   }
 
   // PinResource/get：拿标题与视频直链（videos.video_list）
@@ -268,12 +277,10 @@
       + '&data=' + encodeURIComponent(data)
       + '&_=' + Date.now();
     try {
-      var res = await fetchWithTimeout(url, {
+      var j = await fetchJsonWithTimeout(url, {
         credentials: 'include',
         headers: { 'X-Pinterest-PWS-Handler': 'www/pin/' + id + '.js' },
       }, CFG.apiTimeoutMs);
-      if (!res.ok) throw new Error('status ' + res.status);
-      var j = await res.json();
       var pin = j.resource_response && j.resource_response.data;
       if (!pin) throw new Error('empty');
       return {
@@ -310,33 +317,54 @@
   }
 
   /* ===== [DOWNLOAD] 下载器 ===== */
+  // v0.2.2 关键加固：TM 的 timeout 在 Chrome MV3 / 旧版上不可靠（连接阶段挂起时 ontimeout 不触发），
+  // 请求会永不回调 → Promise 永不 settle → 整个打包流程卡死（用户环境实测症状）。
+  // 这里加 JS 层守卫定时器 + settled 标志 + abort()，保证任何情况下 Promise 都会 settle。
   function gmFetch(url) {
     return new Promise(function (resolve, reject) {
-      GM.xmlHttpRequest({
-        method: 'GET',
-        url: url,
-        responseType: 'arraybuffer',
-        headers: { Referer: 'https://www.pinterest.com/' },
-        timeout: 30000,
-        onload: function (r) {
-          if (r.status >= 200 && r.status < 300) resolve(r.response);
-          else reject(new Error('GM status ' + r.status));
-        },
-        onerror: function () { reject(new Error('GM network error')); },
-        ontimeout: function () { reject(new Error('GM timeout')); },
-      });
+      var settled = false, req = null, guard = null;
+      function finish(fn, arg) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(guard);
+        if (req && req.abort) { try { req.abort(); } catch (e) {} }
+        fn(arg);
+      }
+      guard = setTimeout(function () {
+        finish(reject, new Error('GM 无响应（疑似网络挂起），已强制放弃'));
+      }, 25000);
+      try {
+        req = GM.xmlHttpRequest({
+          method: 'GET',
+          url: url,
+          responseType: 'arraybuffer',
+          headers: { Referer: 'https://www.pinterest.com/' },
+          timeout: 20000,
+          onload: function (r) {
+            if (r.status >= 200 && r.status < 300 && r.response) finish(resolve, r.response);
+            else finish(reject, new Error('GM status ' + r.status));
+          },
+          onerror: function () { finish(reject, new Error('GM network error')); },
+          ontimeout: function () { finish(reject, new Error('GM timeout')); },
+        });
+      } catch (e) { finish(reject, e); }
     });
   }
 
   // GM 优先（无 CORS 限制），失败回退页面 fetch（i.pinimg.com 实测对页面 Origin 放行）
+  // v0.2.2：回退 fetch 加 AbortController 超时——此前无超时，body 卡住会永久挂起
   async function fetchBlob(url) {
     try {
       var buf = await gmFetch(url);
       return new Blob([buf]);
     } catch (e) {
-      var res = await fetch(url);
-      if (!res.ok) throw new Error('fetch status ' + res.status);
-      return await res.blob();
+      var ctrl = new AbortController();
+      var t = setTimeout(function () { ctrl.abort(); }, 30000);
+      try {
+        var res = await fetch(url, { signal: ctrl.signal });
+        if (!res.ok) throw new Error('fetch status ' + res.status);
+        return await res.blob();
+      } finally { clearTimeout(t); }
     }
   }
 
@@ -356,7 +384,12 @@
     if (initMap) urls.push(new URL(initMap, base).href);
     for (var j = 0; j < segments.length; j++) urls.push(new URL(segments[j], base).href);
     var parts = [];
+    var t0 = Date.now();
     for (var k = 0; k < urls.length; k++) {
+      if (Date.now() - t0 > 90000) {
+        S.skippedSegments += urls.length - k;
+        throw new Error('HLS 分片总耗时超限，放弃剩余分片');
+      }
       try { parts.push(await fetchBlob(urls[k])); }
       catch (e) { S.skippedSegments++; }
     }
@@ -377,7 +410,9 @@
     var p = posterPath(origUrl);
     if (!p) return null;
     var ress = ['720p', '480p', '360p'];
+    var t0 = Date.now();
     for (var i = 0; i < ress.length; i++) {
+      if (Date.now() - t0 > 40000) return null;   // v0.2.2：总时限，避免三档探测放大挂起
       var url = 'https://v.pinimg.com/videos/mc/' + ress[i] + '/'
         + p.x + '/' + p.y + '/' + p.z + '/' + p.hash + '.mp4';
       try {
@@ -487,6 +522,13 @@
   async function saveZip() {
     setState('downloading');
     S.skippedSegments = 0;
+    S.abortAll = false;
+    // v0.2.2 看门狗：极端网络挂起时强制恢复 UI，杜绝「按钮永久变灰」；正常打包不受影响
+    var watchdog = setTimeout(function () {
+      S.abortAll = true;
+      setState('idle');
+      log('打包总时长超限（疑似网络挂起），已中止剩余项目，可重新点击打包');
+    }, CFG.zipWatchdogMs);
     var zip = new JSZip();
     var folders = {
       images: zip.folder('images'),
@@ -502,7 +544,7 @@
     renderPanel();
 
     async function worker() {
-      while (queue.length) {
+      while (queue.length && !S.abortAll) {
         var item = queue.shift();
         var idx = items.indexOf(item);
         try { await processItem(item, idx, folders, notes); }
@@ -528,15 +570,19 @@
         : '全部成功，无降级项。'));
     var name = 'pinterest-' + detectPageType() + '-' + stamp() + '.zip';
     try {
-      var blob = await zip.generateAsync({ type: 'blob' });
+      // streamFiles 降低内存峰值；STORE 因为图片/视频已是压缩格式，再压无收益只费 CPU
+      var blob = await zip.generateAsync({ type: 'blob', streamFiles: true, compression: 'STORE' });
       S.lastZip = { blob: blob, name: name };   // 「下载 zip」按钮兜底：点击时新建用户手势，必定触发
-      downloadBlob(blob, name);
       flushDlSet();
       log('zip 已生成：' + name + '。若浏览器未弹出下载，点面板「下载 zip」按钮');
     } catch (e) {
       log('打包失败：' + (e && e.message || e));
+    } finally {
+      clearTimeout(watchdog);
+      setState('idle');   // v0.2.2：任何情况（含异常）都恢复 UI，按钮不再永久变灰
     }
-    setState('idle');
+    // 自动下载放在 UI 恢复之后：长异步链末尾的 a.click 已无用户手势，被浏览器拦截也不影响（「下载 zip」按钮兜底）
+    if (S.lastZip) downloadBlob(S.lastZip.blob, S.lastZip.name);
   }
 
   /* ===== [SINGLE] 详情页单张保存 ===== */
@@ -683,7 +729,7 @@
       renderPanel();
     });
     el.querySelector('#psaver-redl').addEventListener('click', function () {
-      if (S.state === 'idle' && S.lastZip) downloadBlob(S.lastZip.blob, S.lastZip.name);
+      if (S.lastZip) downloadBlob(S.lastZip.blob, S.lastZip.name);   // 用户手势内触发，必定弹出下载
     });
   }
 
@@ -699,6 +745,7 @@
   }
 
   function renderPanel() {
+    try {
     var panel = document.getElementById('psaver-panel');
     if (!panel) return;
     panel.style.display = S.panelOpen ? 'block' : 'none';
@@ -738,15 +785,17 @@
     singleBtn.style.opacity = singleBtn.disabled ? '.5' : '1';
 
     var redlBtn = document.getElementById('psaver-redl');
-    redlBtn.style.display = (S.lastZip && S.state === 'idle') ? 'block' : 'none';
+    redlBtn.style.display = S.lastZip ? 'block' : 'none';   // v0.2.2：有 zip 就显示，不依赖 state
 
     document.getElementById('psaver-log').textContent = S.log || '';
+    } catch (e) { /* 面板渲染异常不阻断下载流程 */ }
   }
 
   /* ===== [INIT] 入口 ===== */
   var lastPath = location.pathname;
 
   function init() {
+    loadDlSet().then(function (s) { S.dlSet = s; });   // GM 存储异步读回（v0.2.2 修复跨会话去重）
     ensureFab();
     ensurePanel();
     renderPanel();

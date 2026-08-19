@@ -20,7 +20,7 @@
 
 ## 安装（一次性；Edge 和 Chrome 各做一次）
 
-1. 装脚本管理器：Edge 扩展商店 / Chrome 网上应用店搜索 **Tampermonkey**（Violentmonkey 也可以）。
+1. 装脚本管理器：Edge 扩展商店 / Chrome 网上应用店搜索 **Tampermonkey**（Violentmonkey 也可以）。**建议升级到最新版**：旧版（< 5.4.6226）存在「请求超时不生效」「超时后自动拉黑网址」等 bug，会导致批量下载卡死。
 2. 打开 Tampermonkey 管理面板 → 「实用工具」→「导入」→ 选择本项目的 `dist/pin-saver.user.js`。
 3. 打开 `pinterest.com` 任意页面，右下角出现「保存」按钮即成功；按 F12 打开 Console 可见 `pin-saver loaded`。
 
@@ -43,17 +43,19 @@
 - 收集期间可以随时点「停止」，已收集的部分仍可打包。
 - 面板有两个去重开关（默认勾选）：「**跳过已收藏**」——跳过你在 Pinterest 上已收藏过的 pin（依赖登录态页面标记，收藏夹页会自动关闭该跳过）；「**跳过已下载**」——跳过本地记录里已下载过的素材（记录存在 Tampermonkey 存储中，跨会话有效）。
 - 打包完成后若浏览器没有自动弹出下载，点面板的「**下载 zip**」按钮即可（点击时的新用户手势必定触发下载，文件在浏览器默认下载目录，`Ctrl+J` / `Cmd+Shift+J` 查看下载列表）。
+- 若「打包下载 ZIP」按钮点击后一直灰色、很久不恢复：说明某个网络请求挂起，脚本会在 10 分钟内自动恢复（看面板日志）；也可以刷新页面重试。建议升级 Tampermonkey 到最新版（旧版有请求超时不生效、超时后自动拉黑网址的 bug）。
 
 ## 工作原理（维护用）
 
 - **原图还原**：页面上的 img 是压缩图（`/236x/` `/474x/` `/736x/` 路径），把尺寸段替换为 `/originals/` 即得原始高清图（同一 hash）。看 `toOriginalUrl()` / `pickBestUrl()`。
 - **双路径提取**：登录态优先调 Pinterest 内部接口（`PinResource/get`）拿标题与视频直链；失败（未登录必 403）静默降级为 DOM 数据。DOM 是主路径，API 仅增强。看 `pinDetail()`。
 - **收集**：自动滚动 + MutationObserver + 轮询，按 pin id / 原图 hash 去重。看 `collectPins()` / `autoScroll()`。
-- **下载**：`GM.xmlHttpRequest`（无 CORS 限制，带 Referer）优先，失败回退页面 fetch。看 `fetchBlob()`。
+- **下载**：`GM.xmlHttpRequest`（无 CORS 限制，带 Referer）优先，失败回退页面 fetch。**每个请求都有脚本层硬超时**（GM 用守卫定时器 + abort、fetch 用 AbortController），保证请求即使挂起也必定结束——Tampermonkey 自带的 `timeout` 在 Chrome MV3 下不生效，不能依赖。看 `gmFetch()` / `fetchBlob()`。
 - **视频**：`video_list` 按分辨率取最高，MP4 直链优先；只有 HLS 时解析 m3u8 分片并顺序拼接（无需 ffmpeg）。看 `getBestVideo()` / `fetchM3u8AndSegments()`。
 - **GIF**：Pinterest 的 GIF pin 原图直接以 `.gif` 结尾，按图片路径下载即保留动图。
 - **去重**：收集时按卡片保存按钮的 `aria-label`（含 "Saved" /「已保存」）跳过已收藏 pin（仅登录态有该标记，未登录自动全收）；按本地 `GM_setValue` 记录跳过已下载过的（key = pin id 或原图 hash）。看 `isSavedCard()` / `loadDlSet()` / `flushDlSet()`。
-- **下载**：打包完成后用页面 `a[download]` 触发下载，并保留 zip 到面板「下载 zip」按钮——点击按钮时是新用户手势，必定触发（`GM_download` 对 blob URL 会存成 txt，已弃用）。看 `downloadBlob()`。
+- **下载**：打包完成后用页面 `a[download]` 触发下载，并保留 zip 到面板「下载 zip」按钮——点击按钮时是新用户手势，必定触发（`GM_download` 对 blob URL 会存成 txt，已弃用）。打包流程有 try/finally + 总时长看门狗（`CFG.zipWatchdogMs`，默认 10 分钟）：任何异常或网络挂起都会恢复面板按钮，不会卡在灰色状态。看 `saveZip()` / `downloadBlob()`。
+- **zip 生成**：`generateAsync({ type: 'blob', streamFiles: true, compression: 'STORE' })`——图片/视频已是压缩格式，STORE 省 CPU、streamFiles 降低内存峰值。
 
 ## 已知限制
 

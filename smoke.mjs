@@ -165,7 +165,7 @@ function savedCard(label) {
 ok('isSavedCard 识别已收藏卡片', T.isSavedCard(savedCard('Saved')));
 ok('isSavedCard 未收藏卡片', !T.isSavedCard(savedCard('Save')));
 
-ok('loadDlSet 解析已下载记录', T.loadDlSet().has(H2));
+ok('loadDlSet 解析已下载记录', (await T.loadDlSet()).has(H2));   // v0.2.2：loadDlSet 改为 async（GM.getValue 是 Promise）
 
 function pinImg(hash, label) {
   const btn = { getAttribute: () => label };

@@ -55,7 +55,7 @@
 - **GIF**：Pinterest 的 GIF pin 原图直接以 `.gif` 结尾，按图片路径下载即保留动图。
 - **去重**：收集时按卡片保存按钮的 `aria-label`（含 "Saved" /「已保存」）跳过已收藏 pin（仅登录态有该标记，未登录自动全收）；按本地 `GM_setValue` 记录跳过已下载过的（key = pin id 或原图 hash）。看 `isSavedCard()` / `loadDlSet()` / `flushDlSet()`。
 - **下载**：打包完成后用页面 `a[download]` 触发下载，并保留 zip 到面板「下载 zip」按钮——点击按钮时是新用户手势，必定触发（`GM_download` 对 blob URL 会存成 txt，已弃用）。打包流程有 try/finally + 总时长看门狗（`CFG.zipWatchdogMs`，默认 10 分钟）：任何异常或网络挂起都会恢复面板按钮，不会卡在灰色状态。看 `saveZip()` / `downloadBlob()`。
-- **zip 生成**：`generateAsync({ type: 'blob', streamFiles: true, compression: 'STORE' })`——图片/视频已是压缩格式，STORE 省 CPU、streamFiles 降低内存峰值。
+- **zip 生成**：文件内容以 **Uint8Array 直传** JSZip（`compression: 'STORE'`，图片/视频已是压缩格式）——JSZip 读 Blob 要走 FileReader，在真实 Tampermonkey 沙箱里会静默挂起，bytes 直传完全绕开；生成时先试流式（省内存），失败/超时（120s）自动重试普通模式。
 
 ## 已知限制
 

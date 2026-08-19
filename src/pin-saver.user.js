@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.2
+// @version      0.2.3
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -540,6 +540,7 @@
     var total = items.length;
     var queue = items.slice();
     var done = 0;
+    log('开始打包 ' + total + ' 张（并发 ' + Math.min(CFG.concurrency, 4) + '）…');
     S.progress = '下载 0/' + total;
     renderPanel();
 
@@ -547,6 +548,10 @@
       while (queue.length && !S.abortAll) {
         var item = queue.shift();
         var idx = items.indexOf(item);
+        // v0.2.3：进度显示当前项的简短 URL——卡住时可直接看出是图片还是视频、哪个链接
+        S.progress = '下载 ' + done + '/' + total + ' · ' + (item.isVideo ? '[视频]' : '[图]')
+          + String(item.origUrl || '').slice(0, 55);
+        renderPanel();
         try { await processItem(item, idx, folders, notes); }
         catch (e) { notes.push('第 ' + (idx + 1) + ' 项处理异常：' + (e && e.message || e)); }
         done++;
@@ -570,11 +575,14 @@
         : '全部成功，无降级项。'));
     var name = 'pinterest-' + detectPageType() + '-' + stamp() + '.zip';
     try {
+      S.progress = '下载完成，生成 zip 中…';
+      renderPanel();
       // streamFiles 降低内存峰值；STORE 因为图片/视频已是压缩格式，再压无收益只费 CPU
       var blob = await zip.generateAsync({ type: 'blob', streamFiles: true, compression: 'STORE' });
       S.lastZip = { blob: blob, name: name };   // 「下载 zip」按钮兜底：点击时新建用户手势，必定触发
       flushDlSet();
-      log('zip 已生成：' + name + '。若浏览器未弹出下载，点面板「下载 zip」按钮');
+      log('zip 已生成：' + name + (notes.length ? '（失败/降级 ' + notes.length + ' 项，详见 zip 内说明.txt）' : '')
+        + '。若浏览器未弹出下载，点面板「下载 zip」按钮');
     } catch (e) {
       log('打包失败：' + (e && e.message || e));
     } finally {
@@ -673,7 +681,7 @@
       + 'border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.18);padding:14px;display:none;';
     el.innerHTML =
       '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
-      + '<b>Pinterest 批量保存</b>'
+      + '<b>Pinterest 批量保存</b> <span id="psaver-ver" style="font-size:11px;color:#999;"></span>'
       + '<span id="psaver-close" style="cursor:pointer;color:#999;font-size:15px;line-height:1;">x</span>'
       + '</div>'
       + '<div id="psaver-status" style="margin-bottom:6px;">已收集 0 个</div>'
@@ -731,11 +739,24 @@
     el.querySelector('#psaver-redl').addEventListener('click', function () {
       if (S.lastZip) downloadBlob(S.lastZip.blob, S.lastZip.name);   // 用户手势内触发，必定弹出下载
     });
+    try {
+      el.querySelector('#psaver-ver').textContent =
+        'v' + scriptVersion() + (typeof GM_info !== 'undefined' && GM_info.version ? ' · TM ' + GM_info.version : '');
+    } catch (e) {}
   }
 
+  // v0.2.3：面板日志同时写 Console（[pin-saver] 前缀，F12 可查；Pinterest 页面的其他警告与此脚本无关）
   function log(msg) {
     S.log = msg;
+    try { console.log('[pin-saver] ' + msg); } catch (e) {}
     renderPanel();
+  }
+
+  function scriptVersion() {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) return GM_info.script.version;
+    } catch (e) {}
+    return '?';
   }
 
   function setState(s) {
@@ -813,7 +834,9 @@
         renderPanel();
       }
     }, 1000);
-    console.log('pin-saver loaded');
+    // v0.2.3：Console 带版本号，便于确认脚本更新成功；面板底部日志同步显示在此（[pin-saver] 前缀）
+    console.log('[pin-saver] loaded v' + scriptVersion()
+      + (typeof GM_info !== 'undefined' && GM_info.version ? ' · TM ' + GM_info.version : ''));
   }
 
   // 测试/调试出口（smoke.mjs 用）

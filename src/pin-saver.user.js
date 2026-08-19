@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.7
+// @version      0.2.8
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -475,6 +475,125 @@
   }
 
   /* ===== [ZIP] 打包 ===== */
+  // v0.2.8：自写 STORE zip 生成器，彻底弃用 JSZip——
+  // 真实 TM 沙箱里 JSZip 的 generateAsync（流式/普通均实测）静默挂起，超时也救不回。
+  // 这里纯 Uint8Array 拼接 + DataView 写头，逻辑全同步（大文件分段让出主线程），不存在可挂起的第三方异步管线。
+  // CRC32 用 slice-by-4 查表（快 3-4 倍）；flag 0x0800 = 文件名按 UTF-8 解释（中文名正常）。
+  var CRC_T = (function () {
+    var T = [new Uint32Array(256)];
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      T[0][n] = c >>> 0;
+    }
+    for (var i = 1; i < 4; i++) {
+      T[i] = new Uint32Array(256);
+      for (var j = 0; j < 256; j++) {
+        var p = T[i - 1][j];
+        T[i][j] = (p >>> 8) ^ T[0][p & 0xFF];
+      }
+    }
+    return T;
+  })();
+
+  function crc32Step(u8, c) {   // slice-by-4，c 为中间状态（初值 0xFFFFFFFF，结果需取反）
+    var i = 0, len = u8.length, end4 = len - (len & 3);
+    for (; i < end4; i += 4) {
+      c = CRC_T[3][(c ^ u8[i]) & 0xFF] ^ CRC_T[2][((c >>> 8) ^ u8[i + 1]) & 0xFF]
+        ^ CRC_T[1][((c >>> 16) ^ u8[i + 2]) & 0xFF] ^ CRC_T[0][((c >>> 24) ^ u8[i + 3]) & 0xFF];
+    }
+    for (; i < len; i++) c = CRC_T[0][(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+    return c;
+  }
+
+  function crc32Of(u8) { return (crc32Step(u8, 0xFFFFFFFF) ^ 0xFFFFFFFF) >>> 0; }
+
+  // 大文件每 8MB 让出一次主线程，避免长图 CRC 时页面无响应
+  async function crc32Chunked(u8) {
+    var c = 0xFFFFFFFF;
+    for (var off = 0; off < u8.length; off += 8388608) {
+      c = crc32Step(u8.subarray(off, Math.min(off + 8388608, u8.length)), c);
+      await new Promise(function (r) { setTimeout(r, 0); });
+    }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function dosDateTime(d) {
+    return {
+      time: d.getHours() << 11 | d.getMinutes() << 5 | Math.floor(d.getSeconds() / 2),
+      date: (d.getFullYear() - 1980) << 9 | (d.getMonth() + 1) << 5 | d.getDate(),
+    };
+  }
+
+  // entries: [{ name, data(Uint8Array) }] → 完整 zip 字节（STORE 无压缩）
+  async function makeZip(entries) {
+    var enc = new TextEncoder();
+    var names = entries.map(function (e) { return enc.encode(e.name); });
+    var i, total = 0, cdSize = 0;
+    for (i = 0; i < entries.length; i++) {
+      total += 30 + names[i].length + entries[i].data.length;
+      cdSize += 46 + names[i].length;
+    }
+    var out = new Uint8Array(total + cdSize + 22);
+    var dv = new DataView(out.buffer);
+    var dt = dosDateTime(new Date());
+    var pos = 0, crcs = [], offsets = [];
+    for (i = 0; i < entries.length; i++) {
+      var data = entries[i].data, nb = names[i];
+      var crc = await crc32Chunked(data);
+      offsets.push(pos);   // central directory 里的「local header 偏移」= 本 header 起点
+      crcs.push(crc);
+      // local file header（30 字节固定）
+      dv.setUint32(pos, 0x04034b50, true); pos += 4;
+      dv.setUint16(pos, 20, true); pos += 2;            // version needed
+      dv.setUint16(pos, 0x0800, true); pos += 2;        // flags：文件名按 UTF-8
+      dv.setUint16(pos, 0, true); pos += 2;             // method：STORE
+      dv.setUint16(pos, dt.time, true); pos += 2;
+      dv.setUint16(pos, dt.date, true); pos += 2;
+      dv.setUint32(pos, crc, true); pos += 4;
+      dv.setUint32(pos, data.length, true); pos += 4;   // csize
+      dv.setUint32(pos, data.length, true); pos += 4;   // usize
+      dv.setUint16(pos, nb.length, true); pos += 2;
+      dv.setUint16(pos, 0, true); pos += 2;             // extra len
+      out.set(nb, pos); pos += nb.length;
+      out.set(data, pos); pos += data.length;
+      try { console.log('[pin-saver] zip 写入 ' + (i + 1) + '/' + entries.length + ' · ' + entries[i].name); } catch (e0) {}
+    }
+    var cdStart = pos;
+    for (i = 0; i < entries.length; i++) {
+      var nb2 = names[i];
+      // central directory header（46 字节固定）
+      dv.setUint32(pos, 0x02014b50, true); pos += 4;
+      dv.setUint16(pos, 20, true); pos += 2;            // version made by
+      dv.setUint16(pos, 20, true); pos += 2;            // version needed
+      dv.setUint16(pos, 0x0800, true); pos += 2;
+      dv.setUint16(pos, 0, true); pos += 2;
+      dv.setUint16(pos, dt.time, true); pos += 2;
+      dv.setUint16(pos, dt.date, true); pos += 2;
+      dv.setUint32(pos, crcs[i], true); pos += 4;
+      dv.setUint32(pos, entries[i].data.length, true); pos += 4;
+      dv.setUint32(pos, entries[i].data.length, true); pos += 4;
+      dv.setUint16(pos, nb2.length, true); pos += 2;
+      dv.setUint16(pos, 0, true); pos += 2;             // extra len
+      dv.setUint16(pos, 0, true); pos += 2;             // comment len
+      dv.setUint16(pos, 0, true); pos += 2;             // disk number start
+      dv.setUint16(pos, 0, true); pos += 2;             // internal attrs
+      dv.setUint32(pos, 0, true); pos += 4;             // external attrs
+      dv.setUint32(pos, offsets[i], true); pos += 4;    // local header offset
+      out.set(nb2, pos); pos += nb2.length;
+    }
+    // end of central directory（22 字节固定）
+    dv.setUint32(pos, 0x06054b50, true); pos += 4;
+    dv.setUint16(pos, 0, true); pos += 2;
+    dv.setUint16(pos, 0, true); pos += 2;
+    dv.setUint16(pos, entries.length, true); pos += 2;
+    dv.setUint16(pos, entries.length, true); pos += 2;
+    dv.setUint32(pos, cdSize, true); pos += 4;
+    dv.setUint32(pos, cdStart, true); pos += 4;
+    dv.setUint16(pos, 0, true); pos += 2;
+    return out;
+  }
+
   // 单个 pin 的处理：API 增强 → 视频/图片分支 → 放入对应 zip 文件夹
   async function processItem(item, idx, folders, notes) {
     var detail = null;
@@ -544,11 +663,11 @@
       setState('idle');
       log('打包总时长超限（疑似网络挂起），已中止剩余项目，可重新点击打包');
     }, CFG.zipWatchdogMs);
-    var zip = new JSZip();
-    var folders = {
-      images: zip.folder('images'),
-      videos: zip.folder('videos'),
-      errors: zip.folder('error_thumbnails'),
+    var entries = [];
+    var folders = {   // 与旧 JSZip folder API 同形，processItem 不用改；file() 直接进 entries
+      images: { file: function (n, d) { entries.push({ name: 'images/' + n, data: d }); } },
+      videos: { file: function (n, d) { entries.push({ name: 'videos/' + n, data: d }); } },
+      errors: { file: function (n, d) { entries.push({ name: 'error_thumbnails/' + n, data: d }); } },
     };
     var notes = [];
     var items = Array.from(S.pins.values());
@@ -581,41 +700,26 @@
     await Promise.all(workers);
 
     if (S.skippedSegments) notes.push('HLS 有 ' + S.skippedSegments + ' 个分片被跳过（平台防盗链）');
-    zip.file('说明.txt',
-      'Pinterest 批量保存说明\n'
-      + '生成时间: ' + new Date().toLocaleString() + '\n'
-      + '共处理 ' + total + ' 个 pin\n'
-      + '去重设置: 跳过已收藏=' + (S.cfg.skipSaved ? '开' : '关') + '，跳过已下载=' + (S.cfg.skipDownloaded ? '开' : '关') + '\n'
-      + '提示: 「已收藏」检测依赖页面标记，未登录或页面改版时自动失效（宁可多收）。\n\n'
-      + (notes.length
-        ? '降级 / 失败记录:\n' + notes.map(function (n) { return '- ' + n; }).join('\n')
-        : '全部成功，无降级项。'));
+    entries.push({
+      name: '说明.txt',
+      data: new TextEncoder().encode(
+        'Pinterest 批量保存说明\n'
+        + '生成时间: ' + new Date().toLocaleString() + '\n'
+        + '共处理 ' + total + ' 个 pin\n'
+        + '去重设置: 跳过已收藏=' + (S.cfg.skipSaved ? '开' : '关') + '，跳过已下载=' + (S.cfg.skipDownloaded ? '开' : '关') + '\n'
+        + '提示: 「已收藏」检测依赖页面标记，未登录或页面改版时自动失效（宁可多收）。\n\n'
+        + (notes.length
+          ? '降级 / 失败记录:\n' + notes.map(function (n) { return '- ' + n; }).join('\n')
+          : '全部成功，无降级项。')),
+    });
     var name = 'pinterest-' + detectPageType() + '-' + stamp() + '.zip';
     try {
       S.progress = '下载完成，生成 zip 中…';
       renderPanel();
-      try { console.log('[pin-saver] 开始生成 zip（' + total + ' 个文件）…'); } catch (e0) {}
-      // v0.2.6：generateAsync 加脚本层硬超时；先试流式（省内存），失败/超时自动重试普通模式（不依赖压缩 Worker，兼容性最好）。
-      // 真实 TM 沙箱里 streamFiles 可能因 Worker 创建失败而静默挂起——重试 + 超时保证必定走到「zip 已生成」或「打包失败」。
-      var blob = null;
-      for (var attempt = 0; attempt < 2 && !blob; attempt++) {
-        var stream = attempt === 0;
-        var t = null;
-        var timeoutP = new Promise(function (_, rej) {
-          t = setTimeout(function () { rej(new Error('zip 生成超时（120s）')); }, 120000);
-        });
-        try {
-          blob = await Promise.race([
-            zip.generateAsync({ type: 'blob', streamFiles: stream, compression: 'STORE' }),
-            timeoutP,
-          ]);
-        } catch (e) {
-          if (!stream) throw e;
-          try { console.warn('[pin-saver] 流式生成失败/超时（' + (e && e.message || e) + '），重试普通模式…'); } catch (e0) {}
-        } finally {
-          clearTimeout(t);
-        }
-      }
+      try { console.log('[pin-saver] 开始生成 zip（' + total + ' 个文件，自写 STORE 直写）…'); } catch (e0) {}
+      // v0.2.8：自写生成器全同步逻辑（内部仅分块让出），不存在可挂起的环节；看门狗仍然兜底
+      var zipBytes = await makeZip(entries);
+      var blob = new Blob([zipBytes], { type: 'application/zip' });
       S.lastZip = { blob: blob, name: name };   // 「下载 zip」按钮兜底：点击时新建用户手势，必定触发
       flushDlSet();
       try { console.log('[pin-saver] zip 已生成，大小 ' + Math.round(blob.size / 104857.6) / 10 + ' MB'); } catch (e0) {}
@@ -913,6 +1017,8 @@
       flushDlSet: flushDlSet,
       collectPins: collectPins,
       downloadBlob: downloadBlob,
+      crc32Of: crc32Of,       // v0.2.8：smoke 与 node zlib.crc32 对照
+      makeZip: makeZip,
       getDedupStats: function () {
         return { skippedSaved: S.skippedSaved, skippedDownloaded: S.skippedDownloaded, dlSize: S.dlSet.size };
       },

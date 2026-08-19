@@ -1,6 +1,8 @@
-// 零依赖冒烟测试：用 node:vm 加载 src，对核心纯函数（URL 还原 / 命名 / 视频选择）做断言。
+// 零依赖冒烟测试：用 node:vm 加载 src，对核心纯函数（URL 还原 / 命名 / 视频选择 / zip 生成）做断言。
 // 用法：node smoke.mjs
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { crc32 as zlibCrc32 } from 'node:zlib';
 import vm from 'node:vm';
 
 const src = readFileSync(new URL('./src/pin-saver.user.js', import.meta.url), 'utf8');
@@ -53,6 +55,7 @@ const context = vm.createContext({
   setTimeout,
   setInterval: () => 0,   // no-op：避免 event loop 常驻
   clearTimeout: () => {},
+  TextEncoder,
   fetch: () => Promise.reject(new Error('fetch not available in smoke')),
   AbortController,
   URL: { createObjectURL: () => 'blob:mock', revokeObjectURL() {} },
@@ -197,6 +200,39 @@ console.log('下载:');
 const clicksBefore = aClicks;
 T.downloadBlob(new Blob(['x']), 't.zip');
 ok('downloadBlob 触发 a[download] 点击', aClicks === clicksBefore + 1);
+
+console.log('zip 生成（v0.2.8 自写 STORE 生成器）:');
+const toBuf = (u8) => Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+const bytes1 = vm.runInContext('new Uint8Array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15])', context);
+const bytes2 = vm.runInContext('new TextEncoder().encode("hello 世界 \\u0000\\n")', context);
+eq('crc32Of 与 node zlib.crc32 一致', T.crc32Of(bytes1), zlibCrc32(toBuf(bytes1)));
+const zipBytes = await T.makeZip([
+  { name: 'images/测试-中文名.bin', data: bytes1 },
+  { name: '说明.txt', data: bytes2 },
+]);
+ok('zip 以 PK\\x03\\x04 开头',
+  zipBytes[0] === 0x50 && zipBytes[1] === 0x4b && zipBytes[2] === 3 && zipBytes[3] === 4);
+ok('zip 以 EOCD(PK\\x05\\x06) 结尾',
+  zipBytes[zipBytes.length - 22] === 0x50 && zipBytes[zipBytes.length - 21] === 0x4b
+  && zipBytes[zipBytes.length - 20] === 5 && zipBytes[zipBytes.length - 19] === 6);
+{
+  // 写盘后用系统 unzip -t 做全格式校验（含 CRC 与目录结构）
+  const tmpZip = '/tmp/psaver-smoke.zip';
+  writeFileSync(tmpZip, toBuf(zipBytes));
+  let unzipOk = true, unzipOut = '';
+  try { unzipOut = execSync('unzip -t ' + tmpZip, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+  catch (e) { unzipOk = false; unzipOut = String(e && e.stdout || '') + String(e && e.stderr || ''); }
+  ok('系统 unzip -t 校验通过', unzipOk);
+  if (!unzipOk) console.log('  unzip 输出: ' + unzipOut.trim().slice(0, 400));
+  ok('两个文件均校验 OK',
+    unzipOk && unzipOut.indexOf('No errors detected') !== -1 && (unzipOut.match(/ OK/g) || []).length === 2);
+  // 中文名解码：unzip 是否支持 -O UTF-8 因系统而异，支持时验证 UTF-8 flag 生效
+  try {
+    const uo = execSync('unzip -O UTF-8 -t ' + tmpZip, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    ok('中文文件名按 UTF-8 正确解码',
+      uo.indexOf('images/测试-中文名.bin') !== -1 && uo.indexOf('说明.txt') !== -1);
+  } catch (e) { console.log('  （本机 unzip 不支持 -O UTF-8，跳过中文名解码断言）'); }
+}
 
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
 process.exit(failed ? 1 : 0);

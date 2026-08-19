@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.5
+// @version      0.2.6
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -584,8 +584,28 @@
     try {
       S.progress = '下载完成，生成 zip 中…';
       renderPanel();
-      // streamFiles 降低内存峰值；STORE 因为图片/视频已是压缩格式，再压无收益只费 CPU
-      var blob = await zip.generateAsync({ type: 'blob', streamFiles: true, compression: 'STORE' });
+      try { console.log('[pin-saver] 开始生成 zip（' + total + ' 个文件）…'); } catch (e0) {}
+      // v0.2.6：generateAsync 加脚本层硬超时；先试流式（省内存），失败/超时自动重试普通模式（不依赖压缩 Worker，兼容性最好）。
+      // 真实 TM 沙箱里 streamFiles 可能因 Worker 创建失败而静默挂起——重试 + 超时保证必定走到「zip 已生成」或「打包失败」。
+      var blob = null;
+      for (var attempt = 0; attempt < 2 && !blob; attempt++) {
+        var stream = attempt === 0;
+        var t = null;
+        var timeoutP = new Promise(function (_, rej) {
+          t = setTimeout(function () { rej(new Error('zip 生成超时（120s）')); }, 120000);
+        });
+        try {
+          blob = await Promise.race([
+            zip.generateAsync({ type: 'blob', streamFiles: stream, compression: 'STORE' }),
+            timeoutP,
+          ]);
+        } catch (e) {
+          if (!stream) throw e;
+          try { console.warn('[pin-saver] 流式生成失败/超时（' + (e && e.message || e) + '），重试普通模式…'); } catch (e0) {}
+        } finally {
+          clearTimeout(t);
+        }
+      }
       S.lastZip = { blob: blob, name: name };   // 「下载 zip」按钮兜底：点击时新建用户手势，必定触发
       flushDlSet();
       log('zip 已生成：' + name + (notes.length ? '（失败/降级 ' + notes.length + ' 项，详见 zip 内说明.txt）' : '')

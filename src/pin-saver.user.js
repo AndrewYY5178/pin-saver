@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.4
+// @version      0.2.5
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -52,6 +52,7 @@
     skippedSaved: 0,
     skippedDownloaded: 0,
     log: '',
+    logHistory: [],   // v0.2.5：日志历史（带时间戳），面板可查 + 一键复制，摆脱 Console 噪音
     progress: '',
   };
 
@@ -711,7 +712,12 @@
       + '<button id="psaver-redl" style="display:none;width:100%;padding:9px 0;background:#e60023;color:#fff;'
       + 'border:0;border-radius:8px;cursor:pointer;font:inherit;font-weight:bold;">下载 zip</button>'
       + '</div>'
-      + '<div id="psaver-log" style="margin-top:8px;color:#888;min-height:18px;"></div>';
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">'
+      + '<span style="font-size:11px;color:#999;">日志（最近 8 条）</span>'
+      + '<button id="psaver-copylog" style="border:0;background:none;color:#e60023;cursor:pointer;font:inherit;font-size:11px;">复制全部日志</button>'
+      + '</div>'
+      + '<div id="psaver-log" style="color:#888;font-size:11px;white-space:pre-wrap;word-break:break-all;'
+      + 'max-height:110px;overflow:auto;min-height:18px;"></div>';
     document.body.appendChild(el);
 
     el.querySelector('#psaver-close').addEventListener('click', function () {
@@ -745,6 +751,16 @@
     el.querySelector('#psaver-redl').addEventListener('click', function () {
       if (S.lastZip) downloadBlob(S.lastZip.blob, S.lastZip.name);   // 用户手势内触发，必定弹出下载
     });
+    el.querySelector('#psaver-copylog').addEventListener('click', function () {
+      var txt = S.logHistory.join('\n') || '（暂无日志）';
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(txt).then(function () {
+            log('日志已复制（' + S.logHistory.length + ' 条），请粘贴发给开发者');
+          }, function () { log('复制失败，请手动选择日志区文字复制'); });
+        } else { log('浏览器不支持剪贴板，请手动选择日志区文字复制'); }
+      } catch (e) { log('复制失败，请手动选择日志区文字复制'); }
+    });
     try {
       el.querySelector('#psaver-ver').textContent =
         'v' + scriptVersion() + (typeof GM_info !== 'undefined' && GM_info.version ? ' · TM ' + GM_info.version : '');
@@ -752,9 +768,14 @@
   }
 
   // v0.2.3：面板日志同时写 Console（[pin-saver] 前缀，F12 可查；Pinterest 页面的其他警告与此脚本无关）
+  // v0.2.5：追加日志历史（带时间戳，最多 200 条），面板滚动区可查 + 一键复制
   function log(msg) {
     S.log = msg;
-    try { console.log('[pin-saver] ' + msg); } catch (e) {}
+    try {
+      S.logHistory.push(stamp().slice(-6) + ' ' + msg);
+      if (S.logHistory.length > 200) S.logHistory.splice(0, S.logHistory.length - 200);
+      console.log('[pin-saver] ' + msg);
+    } catch (e) {}
     renderPanel();
   }
 
@@ -814,7 +835,7 @@
     var redlBtn = document.getElementById('psaver-redl');
     redlBtn.style.display = S.lastZip ? 'block' : 'none';   // v0.2.2：有 zip 就显示，不依赖 state
 
-    document.getElementById('psaver-log').textContent = S.log || '';
+    document.getElementById('psaver-log').textContent = S.logHistory.slice(-8).join('\n') || '';
     } catch (e) { /* 面板渲染异常不阻断下载流程 */ }
   }
 

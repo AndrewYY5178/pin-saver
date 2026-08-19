@@ -194,15 +194,9 @@ ok('flushDlSet 写入 GM 存储为数组', Array.isArray(gmStore.psaver_download
 ok('flushDlSet 保留已下载 key', gmStore.psaver_downloaded.indexOf(H2) !== -1);
 
 console.log('下载:');
-const dlCalls = [];
-context.GM.download = (o) => { dlCalls.push(o); };
-T.downloadBlob(new Blob(['x']), 't.zip');
-eq('GM_download 收到 name/saveAs', dlCalls.length === 1 && dlCalls[0].name + '/' + dlCalls[0].saveAs, 't.zip/false');
-ok('GM_download url 为 blob:', dlCalls[0] && String(dlCalls[0].url).indexOf('blob:') === 0);
-context.GM.download = () => { throw new Error('denied'); };
 const clicksBefore = aClicks;
-T.downloadBlob(new Blob(['x']), 't2.zip');
-ok('GM_download 异常回退 a[download] 触发', aClicks === clicksBefore + 1);
+T.downloadBlob(new Blob(['x']), 't.zip');
+ok('downloadBlob 触发 a[download] 点击', aClicks === clicksBefore + 1);
 
 console.log('\n结果：' + passed + ' 通过，' + failed + ' 失败');
 process.exit(failed ? 1 : 0);

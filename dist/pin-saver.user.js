@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.2.0
+// @version      0.2.1
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -9,7 +9,6 @@
 // @grant        GM.xmlHttpRequest
 // @grant        GM.setValue
 // @grant        GM.getValue
-// @grant        GM.download
 // @connect      i.pinimg.com
 // @connect      v.pinimg.com
 // @run-at       document-idle
@@ -413,20 +412,9 @@
       + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
   }
 
+  // 页面 a[download] 下载：在用户手势内触发 100% 可靠；GM_download 处理 blob URL 会存成 txt（弃用）
   function downloadBlob(blob, name) {
     var url = URL.createObjectURL(blob);
-    // GM_download 走扩展级下载 API，绕过 Chrome 对异步触发下载的「自动下载」拦截
-    if (typeof GM !== 'undefined' && GM.download) {
-      try {
-        GM.download({
-          url: url,
-          name: name,
-          saveAs: false,
-          onerror: function () { log('浏览器拒绝下载 ' + name + '，请点「重新下载」重试'); },
-        });
-        return;
-      } catch (e) { /* 回退页面 a[download] 方式 */ }
-    }
     var a = document.createElement('a');
     a.href = url;
     a.download = name;
@@ -541,10 +529,10 @@
     var name = 'pinterest-' + detectPageType() + '-' + stamp() + '.zip';
     try {
       var blob = await zip.generateAsync({ type: 'blob' });
-      S.lastZip = { blob: blob, name: name };   // 「重新下载」兜底：下载列表没出现时点它重下
+      S.lastZip = { blob: blob, name: name };   // 「下载 zip」按钮兜底：点击时新建用户手势，必定触发
       downloadBlob(blob, name);
       flushDlSet();
-      log('zip 已生成：' + name + '；若未弹出下载，点「重新下载」或查看地址栏拦截提示');
+      log('zip 已生成：' + name + '。若浏览器未弹出下载，点面板「下载 zip」按钮');
     } catch (e) {
       log('打包失败：' + (e && e.message || e));
     }
@@ -660,8 +648,8 @@
       + 'border-radius:8px;cursor:pointer;font:inherit;">打包下载 ZIP</button>'
       + '<button id="psaver-single" style="display:none;width:100%;padding:7px 0;background:#111;'
       + 'color:#fff;border:0;border-radius:8px;cursor:pointer;font:inherit;">保存此 pin</button>'
-      + '<button id="psaver-redl" style="display:none;width:100%;padding:7px 0;background:#fff;color:#111;'
-      + 'border:1px solid #ccc;border-radius:8px;cursor:pointer;font:inherit;">重新下载 zip</button>'
+      + '<button id="psaver-redl" style="display:none;width:100%;padding:9px 0;background:#e60023;color:#fff;'
+      + 'border:0;border-radius:8px;cursor:pointer;font:inherit;font-weight:bold;">下载 zip</button>'
       + '</div>'
       + '<div id="psaver-log" style="margin-top:8px;color:#888;min-height:18px;"></div>';
     document.body.appendChild(el);

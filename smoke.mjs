@@ -23,6 +23,7 @@ function makeEl(tag) {
     querySelector() { return makeEl(); },
     querySelectorAll() { return []; },
     getAttribute() { return null; },
+    setAttribute() {},
   };
 }
 

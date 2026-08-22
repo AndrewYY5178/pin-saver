@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pinterest 批量保存素材
 // @namespace    pin-saver
-// @version      0.3.0
+// @version      0.3.1
 // @description  批量保存 Pinterest 图片/GIF/视频（原图不压缩），收集后打包为单个 Zip。登录/未登录均可使用；可跳过已收藏与已下载过的素材。
 // @match        https://www.pinterest.com/*
 // @match        https://pinterest.com/*
@@ -971,13 +971,15 @@
   function ensureFab() {
     if (document.getElementById('psaver-fab')) return;
     var t = theme();
-    var fab = document.createElement('div');
+    var fab = document.createElement('button');
     fab.id = 'psaver-fab';
     fab.style.cssText =
       'position:fixed;right:16px;bottom:16px;z-index:2147483646;background:' + t.fab + ';color:' + t.fabText + ';'
-      + 'font:13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:10px 14px;'
-      + 'border-radius:24px;cursor:pointer;box-shadow:0 2px 12px rgba(0,0,0,.25);'
+      + 'font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:11px 15px;border:0;'
+      + 'border-radius:24px;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.22);'
       + 'user-select:none;display:flex;align-items:center;gap:8px;overflow:hidden;';
+    fab.type = 'button';
+    fab.setAttribute('aria-label', '打开 Pinterest 批量保存面板');
     fab.innerHTML = '<span>保存</span>'
       + '<span id="psaver-count" style="display:none;background:' + t.accent + ';border-radius:10px;'
       + 'padding:1px 7px;font-size:11px;">0</span>'
@@ -997,53 +999,67 @@
     var t = theme();
     var el = document.createElement('div');
     el.id = 'psaver-panel';
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-label', 'Pinterest 批量保存');
     el.style.cssText =
-      'position:fixed;right:16px;bottom:64px;z-index:2147483646;width:290px;background:' + t.paper + ';'
+      'position:fixed;right:16px;bottom:68px;z-index:2147483646;width:320px;max-width:calc(100vw - 24px);'
+      + 'max-height:calc(100vh - 92px);overflow:auto;box-sizing:border-box;background:' + t.paper + ';'
       + 'color:' + t.ink + ';font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
-      + 'border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.18);padding:14px;display:none;';
+      + 'border:1px solid ' + t.rule + ';border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.18);'
+      + 'padding:16px;display:none;';
     el.innerHTML =
-      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
-      + '<b>Pinterest 批量保存</b>'
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">'
+      + '<span style="display:flex;flex-direction:column;gap:1px;">'
+      + '<b style="font-size:14px;letter-spacing:-.1px;">Pinterest 批量保存</b>'
+      + '<span style="font-size:11px;color:' + t.inkLight + ';">原图收集与打包</span></span>'
       + '<span style="display:flex;align-items:center;gap:6px;">'
       + '<span id="psaver-ver" style="font-size:11px;color:' + t.inkLight + ';"></span>'
       + '<button id="psaver-theme-btn" title="切换主题" style="display:inline-flex;align-items:center;gap:4px;'
       + 'border:1px solid ' + t.rule + ';background:' + t.paper + ';color:' + t.ink
       + ';border-radius:6px;cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;">'
       + '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:' + t.accent + ';"></span>主题</button>'
-      + '<span id="psaver-close" style="cursor:pointer;color:' + t.inkLight + ';font-size:15px;line-height:1;">x</span>'
+      + '<button id="psaver-close" type="button" aria-label="关闭面板" style="width:24px;height:24px;border:0;'
+      + 'background:transparent;color:' + t.inkLight + ';cursor:pointer;font:17px/1 inherit;padding:0;">×</button>'
       + '</span>'
       + '</div>'
-      + '<div id="psaver-themes" style="display:none;flex-wrap:wrap;gap:5px;margin-bottom:8px;"></div>'
-      + '<div id="psaver-status" style="margin-bottom:6px;">已收集 0 个</div>'
-      + '<div id="psaver-progress" style="margin-bottom:8px;color:' + t.inkLight + ';min-height:18px;"></div>'
-      + '<div id="psaver-opts" style="margin-bottom:10px;font-size:12px;color:' + t.ink + ';">'
+      + '<div id="psaver-themes" role="menu" style="display:none;position:absolute;right:44px;top:44px;z-index:2;'
+      + 'width:210px;box-sizing:border-box;flex-wrap:wrap;gap:6px;padding:10px;background:' + t.paper + ';'
+      + 'border:1px solid ' + t.rule + ';border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.16);"></div>'
+      + '<div style="padding:11px 12px;border:1px solid ' + t.rule + ';border-radius:10px;margin-bottom:10px;">'
+      + '<div id="psaver-status" style="font-weight:600;">已收集 0 个</div>'
+      + '<div id="psaver-progress" style="display:none;margin-top:3px;color:' + t.inkLight + ';font-size:12px;"></div>'
+      + '</div>'
+      + '<div id="psaver-actions" style="display:flex;gap:8px;flex-direction:column;margin-bottom:10px;">'
+      + '<button id="psaver-start" style="width:100%;min-height:38px;padding:8px 12px;background:' + t.accent + ';color:' + t.onAccent
+      + ';border:1px solid ' + t.accent + ';border-radius:9px;cursor:pointer;font:600 13px/1.2 inherit;">开始收集</button>'
+      + '<button id="psaver-stop" style="width:100%;min-height:38px;padding:8px 12px;background:' + t.paper + ';color:' + t.ink
+      + ';border:1px solid ' + t.rule + ';border-radius:9px;cursor:pointer;font:600 13px/1.2 inherit;display:none;">停止收集</button>'
+      + '<button id="psaver-zip" style="display:none;width:100%;min-height:38px;padding:8px 12px;background:' + t.accent + ';color:' + t.onAccent
+      + ';border:1px solid ' + t.accent + ';border-radius:9px;cursor:pointer;font:600 13px/1.2 inherit;">打包下载 ZIP</button>'
+      + '<button id="psaver-single" style="display:none;width:100%;min-height:38px;padding:8px 12px;background:' + t.accent
+      + ';color:' + t.onAccent + ';border:1px solid ' + t.accent + ';border-radius:9px;cursor:pointer;font:600 13px/1.2 inherit;">保存此 pin</button>'
+      + '<button id="psaver-redl" style="display:none;width:100%;min-height:38px;padding:8px 12px;background:' + t.paper + ';color:'
+      + t.accent + ';border:1px solid ' + t.accent + ';border-radius:9px;cursor:pointer;font:600 13px/1.2 inherit;">再次下载上次 ZIP</button>'
+      + '</div>'
+      + '<details id="psaver-settings" style="border-top:1px solid ' + t.rule + ';padding-top:9px;">'
+      + '<summary style="cursor:pointer;color:' + t.inkLight + ';font-size:12px;user-select:none;">下载选项</summary>'
+      + '<div id="psaver-opts" style="padding:8px 0 2px;font-size:12px;color:' + t.ink + ';">'
       + '<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;">'
-      + '<input type="checkbox" id="psaver-opt-saved" style="margin:0;"> 跳过已收藏'
+      + '<input type="checkbox" id="psaver-opt-saved" style="margin:0;accent-color:' + t.accent + ';"> 跳过已收藏'
       + '<span id="psaver-opt-saved-note" style="display:none;color:' + t.inkLight + ';">（收藏夹页自动关闭）</span></label>'
       + '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;">'
-      + '<input type="checkbox" id="psaver-opt-dl" style="margin:0;"> 跳过已下载过的</label>'
-      + '</div>'
-      + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
-      + '<button id="psaver-start" style="flex:1;padding:7px 0;background:' + t.accent + ';color:' + t.onAccent
-      + ';border:0;border-radius:8px;cursor:pointer;font:inherit;">开始收集</button>'
-      + '<button id="psaver-stop" style="flex:1;padding:7px 0;background:' + t.paper + ';color:' + t.ink
-      + ';border:1px solid ' + t.rule + ';border-radius:8px;cursor:pointer;font:inherit;display:none;">停止</button>'
-      + '<button id="psaver-zip" style="flex:1;padding:7px 0;background:' + t.accent + ';color:' + t.onAccent
-      + ';border:0;border-radius:8px;cursor:pointer;font:inherit;">打包下载 ZIP</button>'
-      + '<button id="psaver-single" style="display:none;width:100%;padding:7px 0;background:' + t.accent
-      + ';color:' + t.onAccent + ';border:0;border-radius:8px;cursor:pointer;font:inherit;">保存此 pin</button>'
-      + '<button id="psaver-redl" style="display:none;width:100%;padding:9px 0;background:' + t.accent + ';color:'
-      + t.onAccent + ';border:0;border-radius:8px;cursor:pointer;font:inherit;font-weight:bold;">下载 zip</button>'
-      + '</div>'
-      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">'
-      + '<span style="font-size:11px;color:' + t.inkLight + ';">日志（最近 8 条）</span>'
+      + '<input type="checkbox" id="psaver-opt-dl" style="margin:0;accent-color:' + t.accent + ';"> 跳过已下载过的</label>'
+      + '</div></details>'
+      + '<details id="psaver-details" style="border-top:1px solid ' + t.rule + ';padding-top:9px;margin-top:9px;">'
+      + '<summary style="cursor:pointer;color:' + t.inkLight + ';font-size:12px;user-select:none;">运行详情与日志</summary>'
+      + '<div style="display:flex;justify-content:flex-end;align-items:center;margin-top:5px;">'
       + '<button id="psaver-copylog" style="border:0;background:none;color:' + t.accent
       + ';cursor:pointer;font:inherit;font-size:11px;">复制全部日志</button>'
       + '</div>'
       + '<div id="psaver-log" style="color:' + t.inkLight + ';font-size:11px;white-space:pre-wrap;word-break:break-all;'
-      + 'max-height:110px;overflow:auto;min-height:18px;"></div>'
+      + 'max-height:110px;overflow:auto;min-height:18px;padding-top:3px;"></div></details>'
       // v0.3.0 AndDream 水印：品牌衬线字体 + 克制的主题色小点，无 emoji
-      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:11px;padding-top:9px;border-top:1px solid ' + t.rule + ';">'
       + '<span style="font-size:11px;color:' + t.inkLight
       + ';font-family:\'Playfair Display\',\'Noto Serif SC\',Georgia,serif;letter-spacing:.5px;">AndDream 出品</span>'
       + '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + t.accent + ';"></span>'
@@ -1055,10 +1071,12 @@
     var themesEl = el.querySelector('#psaver-themes');
     Object.keys(THEMES).forEach(function (k) {
       var th = THEMES[k];
-      var g = document.createElement('span');
+      var g = document.createElement('button');
+      g.type = 'button';
+      g.setAttribute('role', 'menuitem');
       g.title = th.name;
       g.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border-radius:12px;'
-        + 'cursor:pointer;font-size:11px;background:' + t.paper + ';color:' + t.ink + ';'
+        + 'cursor:pointer;font:11px/1.4 inherit;background:' + t.paper + ';color:' + t.ink + ';'
         + 'border:1px solid ' + (k === S.theme ? th.accent : t.rule) + ';';
       th.swatches.forEach(function (c) {
         var d = document.createElement('span');
@@ -1164,7 +1182,9 @@
       + (S.skippedSaved || S.skippedDownloaded
         ? '，跳过已收藏 ' + S.skippedSaved + '、已下载 ' + S.skippedDownloaded
         : '');
-    document.getElementById('psaver-progress').textContent = S.progress;
+    var progressEl = document.getElementById('psaver-progress');
+    progressEl.textContent = S.progress;
+    progressEl.style.display = S.progress ? 'block' : 'none';
 
     var isBoard = detectPageType() === 'board';
     var optSaved = document.getElementById('psaver-opt-saved');
@@ -1173,22 +1193,33 @@
     document.getElementById('psaver-opt-saved-note').style.display = isBoard ? 'inline' : 'none';
     document.getElementById('psaver-opt-dl').checked = S.cfg.skipDownloaded;
 
-    document.getElementById('psaver-start').style.display =
-      S.state === 'collecting' ? 'none' : 'inline-block';
+    var isPinPage = detectPageType() === 'pin';
+    var startBtn = document.getElementById('psaver-start');
+    startBtn.style.display = S.state === 'collecting' || isPinPage ? 'none' : 'block';
+    startBtn.disabled = S.state !== 'idle';
+    startBtn.textContent = S.pins.size ? '继续收集' : '开始收集';
+    startBtn.style.background = S.pins.size ? theme().paper : theme().accent;
+    startBtn.style.color = S.pins.size ? theme().accent : theme().onAccent;
+    startBtn.style.opacity = startBtn.disabled ? '.5' : '1';
     document.getElementById('psaver-stop').style.display =
-      S.state === 'collecting' ? 'inline-block' : 'none';
+      S.state === 'collecting' ? 'block' : 'none';
 
     var zipBtn = document.getElementById('psaver-zip');
     zipBtn.disabled = S.state !== 'idle' || S.pins.size === 0;
+    zipBtn.style.display = S.pins.size && !isPinPage && S.state !== 'collecting' ? 'block' : 'none';
+    zipBtn.textContent = S.state === 'downloading'
+      ? '正在打包…'
+      : '下载 ' + S.pins.size + ' 项 ZIP';
     zipBtn.style.opacity = zipBtn.disabled ? '.5' : '1';
 
     var singleBtn = document.getElementById('psaver-single');
-    singleBtn.style.display = detectPageType() === 'pin' ? 'block' : 'none';
+    singleBtn.style.display = isPinPage ? 'block' : 'none';
+    singleBtn.textContent = S.state === 'downloading' ? '正在保存…' : '保存此 pin';
     singleBtn.disabled = S.state !== 'idle';
     singleBtn.style.opacity = singleBtn.disabled ? '.5' : '1';
 
     var redlBtn = document.getElementById('psaver-redl');
-    redlBtn.style.display = S.lastZip ? 'block' : 'none';   // v0.2.2：有 zip 就显示，不依赖 state
+    redlBtn.style.display = S.lastZip && S.state === 'idle' ? 'block' : 'none';
 
     document.getElementById('psaver-log').textContent = S.logHistory.slice(-8).join('\n') || '';
     } catch (e) { /* 面板渲染异常不阻断下载流程 */ }
